@@ -16,6 +16,8 @@ pub mod instructions;
 pub mod math;
 pub mod state;
 
+use instructions::*;
+
 // Matches target/deploy/chiefliquidity-keypair.json. Regenerate the keypair
 // (and update this constant) before publishing to a public cluster.
 solana_program::declare_id!("D8K39AXioKew7kLfKEjsBtW3BuDXnYqntk2z4PWxzPAW");
@@ -76,9 +78,25 @@ pub fn process_instruction(
         .map_err(|_| ProgramError::InvalidInstructionData)?;
 
     match instruction {
-        LiquidityInstruction::InitializePool { .. } => {
-            msg!("Instruction: InitializePool (not yet implemented)");
-            Err(ProgramError::InvalidInstructionData)
+        LiquidityInstruction::InitializePool {
+            swap_fee_bps,
+            protocol_fee_bps,
+            liq_ratio_bps,
+            liq_penalty_bps,
+            max_ltv_bps,
+            interest_rate_bps_per_year,
+        } => {
+            msg!("Instruction: InitializePool");
+            process_initialize_pool(
+                program_id,
+                accounts,
+                swap_fee_bps,
+                protocol_fee_bps,
+                liq_ratio_bps,
+                liq_penalty_bps,
+                max_ltv_bps,
+                interest_rate_bps_per_year,
+            )
         }
     }
 }
