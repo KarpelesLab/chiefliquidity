@@ -27,11 +27,18 @@ jobs:
       - name: Generate keypair
         run: solana-keygen new --no-bip39-passphrase
 
-      - name: Run host unit + integration tests
-        run: cargo test --workspace --locked
+      - name: Run host unit tests
+        run: cargo test --lib --workspace --locked
 
       - name: Build SBF program
         run: cargo build-sbf --workspace -- --locked
+
+      - name: Run integration tests (separate workspace)
+        # integration-tests/ is its own cargo project so its heavy
+        # solana-program-test dev-dep tree doesn't pollute the lib's
+        # Cargo.lock that solana-verify resolves with cargo 1.78.
+        working-directory: integration-tests
+        run: cargo test --locked
 
       - name: Start test validator with upgradeable program
         run: |
