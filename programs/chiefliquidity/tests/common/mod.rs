@@ -425,6 +425,183 @@ impl TestEnv {
         (user, ata_a, ata_b, ata_lp)
     }
 
+    // ---- Loan helpers ----
+
+    pub async fn band_state(
+        &mut self,
+        direction: u8,
+        band_id: u32,
+    ) -> Option<LoanIndexBand> {
+        let (band_pda, _) = self.band_pda(direction, band_id);
+        self.banks_client
+            .get_account(band_pda)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|acc| LoanIndexBand::try_from_slice(&acc.data).ok())
+    }
+
+    pub async fn loan_state(&mut self, loan_pda: &Pubkey) -> Option<Loan> {
+        self.banks_client
+            .get_account(*loan_pda)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|acc| Loan::try_from_slice(&acc.data).ok())
+    }
+
+    pub async fn loan_link_state(&mut self, link_pda: &Pubkey) -> Option<LoanLink> {
+        self.banks_client
+            .get_account(*link_pda)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|acc| LoanLink::try_from_slice(&acc.data).ok())
+    }
+
+    /// Build + submit an OpenLoan instruction. Returns the assigned nonce
+    /// (= pool.next_loan_nonce at call time) so the test can rederive the
+    /// loan PDA later.
+    pub async fn open_loan(
+        &mut self,
+        borrower: &Keypair,
+        user_a: &Pubkey,
+        user_b: &Pubkey,
+        sides: u8,
+        collateral_amount: u64,
+        debt_amount: u64,
+    ) -> Result<u64, TransportError> {
+        let pool = self.pool_state().await;
+        let nonce = pool.next_loan_nonce;
+        let liq_ratio = pool.liq_ratio_bps;
+
+        let (loan_pda, _) = self.loan_pda(&borrower.pubkey(), nonce);
+        let (link_pda, _) = self.loan_link_pda(&loan_pda);
+
+        let sides_enum =
+            chiefliquidity::math::LoanSides::from_u8(sides).expect("sides byte");
+        let (trigger_wad, dir) = chiefliquidity::math::recompute_trigger(
+            sides_enum,
+            collateral_amount as u128,
+            debt_amount as u128,
+            liq_ratio,
+        )
+        .expect("trigger");
+        let band_id =
+            chiefliquidity::math::band_id_for_trigger(trigger_wad).expect("band_id");
+        let (band_pda, _) = self.band_pda(dir as u8, band_id);
+
+        // Old tail: existing band tail if non-empty; else placeholder = link_pda.
+        let old_tail = self
+            .band_state(dir as u8, band_id)
+            .await
+            .filter(|b| b.count > 0)
+            .map(|b| b.tail_link)
+            .unwrap_or(link_pda);
+
+        let data = LiquidityInstruction::OpenLoan {
+            sides,
+            collateral_amount,
+            debt_amount,
+            nonce,
+        };
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(self.pool_pda().0, false),
+                AccountMeta::new(self.vault_a_pda().0, false),
+                AccountMeta::new(self.vault_b_pda().0, false),
+                AccountMeta::new(*user_a, false),
+                AccountMeta::new(*user_b, false),
+                AccountMeta::new_readonly(self.mint_a.pubkey(), false),
+                AccountMeta::new_readonly(self.mint_b.pubkey(), false),
+                AccountMeta::new(borrower.pubkey(), true),
+                AccountMeta::new(loan_pda, false),
+                AccountMeta::new(link_pda, false),
+                AccountMeta::new(band_pda, false),
+                AccountMeta::new(old_tail, false),
+                AccountMeta::new_readonly(solana_program::system_program::id(), false),
+                AccountMeta::new_readonly(self.token_program, false),
+            ],
+            data: borsh::to_vec(&data).unwrap(),
+        };
+        self.send_with_new_blockhash(&[ix], &[borrower]).await?;
+        Ok(nonce)
+    }
+
+    /// Build + submit a RepayLoan instruction.
+    pub async fn repay_loan(
+        &mut self,
+        borrower: &Keypair,
+        user_a: &Pubkey,
+        user_b: &Pubkey,
+        nonce: u64,
+    ) -> Result<(), TransportError> {
+        let (loan_pda, _) = self.loan_pda(&borrower.pubkey(), nonce);
+        let (link_pda, _) = self.loan_link_pda(&loan_pda);
+        let link = self
+            .loan_link_state(&link_pda)
+            .await
+            .expect("loan_link not found");
+        let (band_pda, _) = self.band_pda(link.direction, link.band_id);
+
+        // Prev/next: if default, pass link itself as placeholder.
+        let prev = if link.prev == Pubkey::default() {
+            link_pda
+        } else {
+            link.prev
+        };
+        let next = if link.next == Pubkey::default() {
+            link_pda
+        } else {
+            link.next
+        };
+
+        let data = LiquidityInstruction::RepayLoan;
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(self.pool_pda().0, false),
+                AccountMeta::new(self.vault_a_pda().0, false),
+                AccountMeta::new(self.vault_b_pda().0, false),
+                AccountMeta::new(*user_a, false),
+                AccountMeta::new(*user_b, false),
+                AccountMeta::new_readonly(self.mint_a.pubkey(), false),
+                AccountMeta::new_readonly(self.mint_b.pubkey(), false),
+                AccountMeta::new(borrower.pubkey(), true),
+                AccountMeta::new(loan_pda, false),
+                AccountMeta::new(link_pda, false),
+                AccountMeta::new(band_pda, false),
+                AccountMeta::new(prev, false),
+                AccountMeta::new(next, false),
+                AccountMeta::new_readonly(self.token_program, false),
+            ],
+            data: borsh::to_vec(&data).unwrap(),
+        };
+        self.send_with_new_blockhash(&[ix], &[borrower]).await
+    }
+
+    /// Build + submit a ClaimLiquidatedRent instruction.
+    pub async fn claim_liquidated_rent(
+        &mut self,
+        borrower: &Keypair,
+        nonce: u64,
+    ) -> Result<(), TransportError> {
+        let (loan_pda, _) = self.loan_pda(&borrower.pubkey(), nonce);
+        let (link_pda, _) = self.loan_link_pda(&loan_pda);
+        let data = LiquidityInstruction::ClaimLiquidatedRent;
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(loan_pda, false),
+                AccountMeta::new(link_pda, false),
+                AccountMeta::new(borrower.pubkey(), true),
+            ],
+            data: borsh::to_vec(&data).unwrap(),
+        };
+        self.send_with_new_blockhash(&[ix], &[borrower]).await
+    }
+
     // ---- State readers ----
 
     pub async fn pool_state(&mut self) -> Pool {
