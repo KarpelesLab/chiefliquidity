@@ -3,6 +3,8 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::pubkey::Pubkey;
 
+use crate::error::LiquidityError;
+
 // ===== PDA seed prefixes =====
 
 pub const POOL_SEED: &[u8] = b"pool";
@@ -150,6 +152,43 @@ impl Pool {
 
     pub fn derive_lp_mint_pda(pool: &Pubkey, program_id: &Pubkey) -> (Pubkey, u8) {
         Pubkey::find_program_address(&[LP_MINT_SEED, pool.as_ref()], program_id)
+    }
+
+    /// LP-owned share of each side, given current vault balances.
+    /// Excludes borrower-deposited collateral (DESIGN.md §2).
+    ///
+    /// `swappable_x = real_x - total_collateral_x`
+    pub fn swappable(
+        &self,
+        real_a: u128,
+        real_b: u128,
+    ) -> Result<(u128, u128), LiquidityError> {
+        let a = real_a
+            .checked_sub(self.total_collateral_a)
+            .ok_or(LiquidityError::MathUnderflow)?;
+        let b = real_b
+            .checked_sub(self.total_collateral_b)
+            .ok_or(LiquidityError::MathUnderflow)?;
+        Ok((a, b))
+    }
+
+    /// Accounted reserves (used for AMM pricing and LP share math).
+    /// Borrowing doesn't move pricing; collateral isn't part of LP claim.
+    ///
+    /// `accounted_x = (real_x - total_collateral_x) + total_debt_x`
+    pub fn accounted(
+        &self,
+        real_a: u128,
+        real_b: u128,
+    ) -> Result<(u128, u128), LiquidityError> {
+        let (s_a, s_b) = self.swappable(real_a, real_b)?;
+        let a = s_a
+            .checked_add(self.total_debt_a)
+            .ok_or(LiquidityError::MathOverflow)?;
+        let b = s_b
+            .checked_add(self.total_debt_b)
+            .ok_or(LiquidityError::MathOverflow)?;
+        Ok((a, b))
     }
 }
 
@@ -547,6 +586,38 @@ mod tests {
         let (c, _) = LoanIndexBand::derive_pda(&pool, 0, 6, &prog);
         assert_ne!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn pool_accounted_excludes_collateral() {
+        // Bare pool: accounted == real
+        let mut p = fake_pool();
+        let (a, b) = p.accounted(1000, 5000).unwrap();
+        assert_eq!((a, b), (1000, 5000));
+
+        // Open a loan: collateral 50 A, debt 100 B.
+        // After open_loan, real_a = 1050, real_b = 4900, total_coll_a = 50, total_debt_b = 100.
+        p.total_collateral_a = 50;
+        p.total_debt_b = 100;
+        let (a, b) = p.accounted(1050, 4900).unwrap();
+        // LP claim should be unchanged from the pre-loan state.
+        assert_eq!((a, b), (1000, 5000));
+
+        // After liquidation: collateral seized (total_coll_a -= 50), debt
+        // forgiven (total_debt_b -= 100). Real balances unchanged.
+        p.total_collateral_a = 0;
+        p.total_debt_b = 0;
+        let (a, b) = p.accounted(1050, 4900).unwrap();
+        assert_eq!((a, b), (1050, 4900)); // LP gained 50 A, lost 100 B
+    }
+
+    #[test]
+    fn pool_swappable_excludes_collateral() {
+        let mut p = fake_pool();
+        p.total_collateral_a = 50;
+        p.total_collateral_b = 0;
+        let (a, b) = p.swappable(1050, 5000).unwrap();
+        assert_eq!((a, b), (1000, 5000));
     }
 
     /// Confirm the corrected LEN constants, since DESIGN.md had arithmetic errors.

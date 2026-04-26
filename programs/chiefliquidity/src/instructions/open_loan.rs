@@ -104,12 +104,8 @@ pub fn process_open_loan(
 
     let real_a = read_token_amount(vault_a_info)?;
     let real_b = read_token_amount(vault_b_info)?;
-    let accounted_a = real_a
-        .checked_add(pool.total_debt_a)
-        .ok_or(LiquidityError::MathOverflow)?;
-    let accounted_b = real_b
-        .checked_add(pool.total_debt_b)
-        .ok_or(LiquidityError::MathOverflow)?;
+    let (accounted_a, accounted_b) = pool.accounted(real_a, real_b)?;
+    let (swappable_a, swappable_b) = pool.swappable(real_a, real_b)?;
     if accounted_a == 0 || accounted_b == 0 {
         return Err(LiquidityError::ZeroReserves.into());
     }
@@ -135,13 +131,13 @@ pub fn process_open_loan(
         return Err(LiquidityError::LtvExceedsMax.into());
     }
 
-    // Real-reserve coverage: must be able to actually pay out the debt.
-    let (debt_vault_real, collateral_vault) = match sides {
-        LoanSides::CollateralA => (real_b, vault_a_info), // debt B paid out from vault_b
-        LoanSides::CollateralB => (real_a, vault_b_info),
+    // Executable-reserve coverage: must be able to actually pay out the debt
+    // from the LP-owned share (collateral in the vault is earmarked).
+    let debt_swappable = match sides {
+        LoanSides::CollateralA => swappable_b,
+        LoanSides::CollateralB => swappable_a,
     };
-    let _ = collateral_vault; // reserved for clarity; flow uses *_info names directly below
-    if (debt_amount as u128) > debt_vault_real {
+    if (debt_amount as u128) > debt_swappable {
         return Err(LiquidityError::InsufficientExecutableLiquidity.into());
     }
 

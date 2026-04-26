@@ -85,12 +85,8 @@ pub fn process_remove_liquidity(
         return Err(LiquidityError::MathUnderflow.into());
     }
 
-    let accounted_a = real_a
-        .checked_add(pool.total_debt_a)
-        .ok_or(LiquidityError::MathOverflow)?;
-    let accounted_b = real_b
-        .checked_add(pool.total_debt_b)
-        .ok_or(LiquidityError::MathOverflow)?;
+    let (accounted_a, accounted_b) = pool.accounted(real_a, real_b)?;
+    let (swappable_a, swappable_b) = pool.swappable(real_a, real_b)?;
 
     let amount_a_out = mul_div(lp_amount as u128, accounted_a, lp_supply)?;
     let amount_b_out = mul_div(lp_amount as u128, accounted_b, lp_supply)?;
@@ -106,10 +102,11 @@ pub fn process_remove_liquidity(
         return Err(LiquidityError::SlippageExceeded.into());
     }
 
-    // Real-reserve coverage check: pool may be heavily lent out and unable to
-    // satisfy the proportional accounted withdrawal. Revert and let the user
-    // wait for repayments / liquidations.
-    if (amount_a_out_u64 as u128) > real_a || (amount_b_out_u64 as u128) > real_b {
+    // Executable-reserve coverage check: pool may be heavily lent out and
+    // unable to satisfy the proportional accounted withdrawal. Collateral
+    // sitting in the vault is earmarked and not redeemable. Revert and let
+    // the user wait for repayments / liquidations.
+    if (amount_a_out_u64 as u128) > swappable_a || (amount_b_out_u64 as u128) > swappable_b {
         return Err(LiquidityError::InsufficientExecutableLiquidity.into());
     }
 

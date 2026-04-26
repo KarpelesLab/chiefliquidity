@@ -85,12 +85,9 @@ pub fn process_add_liquidity(
     let real_a = read_token_amount(vault_a_info)?;
     let real_b = read_token_amount(vault_b_info)?;
 
-    let accounted_a = real_a
-        .checked_add(pool.total_debt_a)
-        .ok_or(LiquidityError::MathOverflow)?;
-    let accounted_b = real_b
-        .checked_add(pool.total_debt_b)
-        .ok_or(LiquidityError::MathOverflow)?;
+    // accounted_x = (real_x - total_collateral_x) + total_debt_x —
+    // collateral is in the vault but earmarked, not part of LP claim.
+    let (accounted_a, accounted_b) = pool.accounted(real_a, real_b)?;
 
     // ---- Deposit-amount derivation ----
     let (amount_a_in, amount_b_in, lp_to_mint) = if lp_supply == 0 {
