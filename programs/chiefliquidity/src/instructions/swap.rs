@@ -1,0 +1,609 @@
+//! Swap with mandatory in-flight liquidation. See `DESIGN.md` §7.
+//!
+//! High-level flow:
+//!   1. Load pool, vault balances, accounted/swappable reserves.
+//!   2. Parse the variable account tail into per-band `(band, [links], [loans])`.
+//!   3. Iteratively: compute post-swap price → find next supplied loan that's
+//!      triggered (direction matches, trigger crosses post_price) → liquidate
+//!      → recompute. Cap at `MAX_LIQ_PER_SWAP`.
+//!   4. Final swap quote against the post-liquidation accounted reserves.
+//!   5. Enforce slippage gate and executable-reserve cap.
+//!   6. Move tokens, persist updated accounts.
+//!
+//! Liquidation is purely accounting: collateral was already in the vault,
+//! debt tokens are simply forgiven. No SPL transfers happen during the
+//! liquidation phase; only the final swap moves tokens.
+
+use borsh::{BorshDeserialize, BorshSerialize};
+use solana_program::{
+    account_info::AccountInfo,
+    clock::Clock,
+    entrypoint::ProgramResult,
+    msg,
+    program::{invoke, invoke_signed},
+    pubkey::Pubkey,
+    sysvar::Sysvar,
+};
+use spl_token_2022::{
+    extension::StateWithExtensions,
+    state::{Account as TokenAccount, Mint},
+};
+
+use crate::{
+    error::LiquidityError,
+    math::{
+        cpmm_quote_out, is_liquidatable, price_b_per_a_wad, LoanSides, TriggerDirection,
+        BPS_DENOM,
+    },
+    state::{
+        is_valid_token_program, Loan, LoanIndexBand, LoanLink, Pool, POOL_SEED,
+    },
+};
+
+/// Per-transaction cap on liquidations, to bound CU and account-list usage.
+pub const MAX_LIQ_PER_SWAP: u32 = 8;
+
+const FIXED_PREFIX_LEN: usize = 9;
+
+#[derive(Debug)]
+struct LoanCtx {
+    /// Index into the global `accounts` slice for this loan's `LoanLink`.
+    link_idx: usize,
+    /// Index into `accounts` for this loan's `Loan`.
+    loan_idx: usize,
+    /// Trigger price (denormalized for fast comparison).
+    trigger_wad: u128,
+    /// Trigger direction (denormalized).
+    direction: TriggerDirection,
+    /// Loan sides (denormalized).
+    sides: LoanSides,
+    /// Original collateral amount.
+    collateral: u128,
+    /// Original debt principal (accrued is bonus to LP).
+    debt_principal: u128,
+    /// Has this loan been liquidated in this swap?
+    liquidated: bool,
+}
+
+#[derive(Debug)]
+struct BandCtx {
+    /// Index into `accounts` for the band PDA.
+    band_idx: usize,
+    /// Indices (into `accounts`) of this band's links, in chain order.
+    link_idxs: Vec<usize>,
+}
+
+pub fn process_swap(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    amount_in: u64,
+    min_out: u64,
+    a_to_b: bool,
+    band_link_counts: Vec<u8>,
+) -> ProgramResult {
+    if accounts.len() < FIXED_PREFIX_LEN {
+        return Err(LiquidityError::InvalidLiquidationContext.into());
+    }
+    let pool_info = &accounts[0];
+    let vault_a_info = &accounts[1];
+    let vault_b_info = &accounts[2];
+    let user_a_info = &accounts[3];
+    let user_b_info = &accounts[4];
+    let mint_a_info = &accounts[5];
+    let mint_b_info = &accounts[6];
+    let user_info = &accounts[7];
+    let token_program_info = &accounts[8];
+
+    if !user_info.is_signer {
+        return Err(LiquidityError::MissingRequiredSigner.into());
+    }
+    if !is_valid_token_program(token_program_info.key) {
+        return Err(LiquidityError::InvalidTokenProgram.into());
+    }
+    if pool_info.owner != program_id {
+        return Err(LiquidityError::InvalidAccountOwner.into());
+    }
+    if amount_in == 0 {
+        return Err(LiquidityError::ZeroAmount.into());
+    }
+
+    let mut pool = {
+        let data = pool_info.try_borrow_data()?;
+        Pool::try_from_slice(&data).map_err(|_| LiquidityError::AccountDataTooSmall)?
+    };
+    if !pool.is_initialized() {
+        return Err(LiquidityError::NotInitialized.into());
+    }
+    if pool.vault_a != *vault_a_info.key
+        || pool.vault_b != *vault_b_info.key
+        || pool.mint_a != *mint_a_info.key
+        || pool.mint_b != *mint_b_info.key
+    {
+        return Err(LiquidityError::InvalidPool.into());
+    }
+
+    // ---- Parse the variable tail ----
+    let mut bands: Vec<BandCtx> = Vec::with_capacity(band_link_counts.len());
+    let mut loans: Vec<LoanCtx> = Vec::new();
+    let mut cursor = FIXED_PREFIX_LEN;
+    let expected_direction = if a_to_b {
+        TriggerDirection::OnRise // A→B raises price → triggers OnRise (B-collateral) loans
+    } else {
+        TriggerDirection::OnFall
+    };
+    let expected_dir_byte = expected_direction as u8;
+
+    for &k_u8 in band_link_counts.iter() {
+        let k = k_u8 as usize;
+        let needed = 1 + 2 * k;
+        if cursor + needed > accounts.len() {
+            return Err(LiquidityError::InvalidLiquidationContext.into());
+        }
+        let band_idx = cursor;
+        let band_info = &accounts[band_idx];
+        if band_info.owner != program_id {
+            return Err(LiquidityError::InvalidAccountOwner.into());
+        }
+        let band = LoanIndexBand::try_from_slice(&band_info.try_borrow_data()?)
+            .map_err(|_| LiquidityError::AccountDataTooSmall)?;
+        if !band.is_initialized()
+            || band.pool != *pool_info.key
+            || band.direction != expected_dir_byte
+        {
+            return Err(LiquidityError::BandMismatch.into());
+        }
+        if band.count as usize != k {
+            // Caller must supply ALL links in any band on the path.
+            return Err(LiquidityError::IncompleteBandWalk.into());
+        }
+
+        let link_start = cursor + 1;
+        let loan_start = link_start + k;
+
+        // Verify chain order: first link == band.head_link;
+        // for i > 0, supplied[i-1].next == supplied[i].pubkey.
+        let mut prev_pubkey = Pubkey::default();
+        let mut link_idxs = Vec::with_capacity(k);
+        for i in 0..k {
+            let link_idx = link_start + i;
+            let link_info = &accounts[link_idx];
+            if link_info.owner != program_id {
+                return Err(LiquidityError::InvalidAccountOwner.into());
+            }
+            let link = LoanLink::try_from_slice(&link_info.try_borrow_data()?)
+                .map_err(|_| LiquidityError::AccountDataTooSmall)?;
+            if !link.is_initialized()
+                || link.pool != *pool_info.key
+                || link.direction != expected_dir_byte
+                || link.band_id != band.band_id
+            {
+                return Err(LiquidityError::LinkChainBroken.into());
+            }
+            if i == 0 {
+                if *link_info.key != band.head_link {
+                    return Err(LiquidityError::LinkChainBroken.into());
+                }
+            } else if link.prev != prev_pubkey {
+                return Err(LiquidityError::LinkChainBroken.into());
+            }
+            // Validate that the next loan account corresponds to this link.
+            let loan_idx = loan_start + i;
+            let loan_info = &accounts[loan_idx];
+            if loan_info.owner != program_id {
+                return Err(LiquidityError::InvalidAccountOwner.into());
+            }
+            if *loan_info.key != link.loan {
+                return Err(LiquidityError::InvalidLiquidationContext.into());
+            }
+            let loan = Loan::try_from_slice(&loan_info.try_borrow_data()?)
+                .map_err(|_| LiquidityError::AccountDataTooSmall)?;
+            if !loan.is_initialized() || loan.pool != *pool_info.key {
+                return Err(LiquidityError::InvalidPool.into());
+            }
+            if !loan.is_open() {
+                return Err(LiquidityError::LoanNotOpen.into());
+            }
+            let direction = TriggerDirection::from_u8(loan.trigger_direction)?;
+            let sides = LoanSides::from_u8(loan.sides)?;
+            if direction != expected_direction {
+                // Caller supplied a loan irrelevant to this swap direction.
+                return Err(LiquidityError::InvalidLiquidationContext.into());
+            }
+            link_idxs.push(link_idx);
+            loans.push(LoanCtx {
+                link_idx,
+                loan_idx,
+                trigger_wad: loan.trigger_price_wad,
+                direction,
+                sides,
+                collateral: loan.collateral_amount,
+                debt_principal: loan.debt_principal,
+                liquidated: false,
+            });
+            prev_pubkey = *link_info.key;
+        }
+        // Verify tail terminates: last supplied link.next == default.
+        if k > 0 {
+            let last_link_info = &accounts[link_start + k - 1];
+            let last_link =
+                LoanLink::try_from_slice(&last_link_info.try_borrow_data()?)
+                    .map_err(|_| LiquidityError::AccountDataTooSmall)?;
+            if last_link.next != Pubkey::default() {
+                return Err(LiquidityError::IncompleteBandWalk.into());
+            }
+        }
+        bands.push(BandCtx { band_idx, link_idxs });
+        cursor += needed;
+    }
+    if cursor != accounts.len() {
+        return Err(LiquidityError::InvalidLiquidationContext.into());
+    }
+
+    // ---- Initial reserve state ----
+    let mint_a_decimals = read_mint_decimals(mint_a_info)?;
+    let mint_b_decimals = read_mint_decimals(mint_b_info)?;
+    let real_a = read_token_amount(vault_a_info)?;
+    let real_b = read_token_amount(vault_b_info)?;
+    let (mut accounted_a, mut accounted_b) = pool.accounted(real_a, real_b)?;
+    if accounted_a == 0 || accounted_b == 0 {
+        return Err(LiquidityError::ZeroReserves.into());
+    }
+
+    // amount_in_after_fee for quote math
+    let fee_bps = pool.swap_fee_bps as u128;
+    if fee_bps >= BPS_DENOM {
+        return Err(LiquidityError::SettingExceedsMaximum.into());
+    }
+    let amount_in_after_fee_const =
+        (amount_in as u128) * (BPS_DENOM - fee_bps) / BPS_DENOM;
+
+    // ---- Iterative liquidation loop ----
+    let mut liq_count = 0u32;
+    loop {
+        // Quote and compute the would-be post_price.
+        let (in_reserve, out_reserve) = if a_to_b {
+            (accounted_a, accounted_b)
+        } else {
+            (accounted_b, accounted_a)
+        };
+        if in_reserve == 0 || out_reserve == 0 {
+            return Err(LiquidityError::ZeroReserves.into());
+        }
+        let amount_out = cpmm_quote_out(
+            amount_in as u128,
+            in_reserve,
+            out_reserve,
+            pool.swap_fee_bps,
+        )?;
+        let (post_a, post_b) = if a_to_b {
+            (
+                accounted_a + amount_in_after_fee_const,
+                accounted_b
+                    .checked_sub(amount_out)
+                    .ok_or(LiquidityError::MathUnderflow)?,
+            )
+        } else {
+            (
+                accounted_a
+                    .checked_sub(amount_out)
+                    .ok_or(LiquidityError::MathUnderflow)?,
+                accounted_b + amount_in_after_fee_const,
+            )
+        };
+        if post_a == 0 {
+            return Err(LiquidityError::ZeroReserves.into());
+        }
+        let post_price_wad = price_b_per_a_wad(post_a, post_b)?;
+
+        // Find next triggered, not-yet-liquidated loan.
+        let next_idx = loans.iter().position(|l| {
+            !l.liquidated && is_liquidatable(l.trigger_wad, l.direction, post_price_wad)
+        });
+        let i = match next_idx {
+            Some(i) => i,
+            None => break,
+        };
+
+        if liq_count >= MAX_LIQ_PER_SWAP {
+            return Err(LiquidityError::TooManyLiquidationsRequired.into());
+        }
+
+        // Apply liquidation (accounting only — collateral already in vault,
+        // debt tokens were already paid out).
+        let lc = &mut loans[i];
+        match lc.sides {
+            LoanSides::CollateralA => {
+                pool.total_collateral_a = pool
+                    .total_collateral_a
+                    .checked_sub(lc.collateral)
+                    .ok_or(LiquidityError::MathUnderflow)?;
+                pool.total_debt_b = pool
+                    .total_debt_b
+                    .checked_sub(lc.debt_principal)
+                    .ok_or(LiquidityError::MathUnderflow)?;
+            }
+            LoanSides::CollateralB => {
+                pool.total_collateral_b = pool
+                    .total_collateral_b
+                    .checked_sub(lc.collateral)
+                    .ok_or(LiquidityError::MathUnderflow)?;
+                pool.total_debt_a = pool
+                    .total_debt_a
+                    .checked_sub(lc.debt_principal)
+                    .ok_or(LiquidityError::MathUnderflow)?;
+            }
+        }
+        pool.open_loans = pool
+            .open_loans
+            .checked_sub(1)
+            .ok_or(LiquidityError::MathUnderflow)?;
+        lc.liquidated = true;
+        liq_count += 1;
+
+        // Recompute accounted reserves with the new pool totals.
+        let (new_a, new_b) = pool.accounted(real_a, real_b)?;
+        accounted_a = new_a;
+        accounted_b = new_b;
+    }
+
+    // ---- Final quote on post-liquidation accounted reserves ----
+    let (in_reserve, out_reserve) = if a_to_b {
+        (accounted_a, accounted_b)
+    } else {
+        (accounted_b, accounted_a)
+    };
+    let amount_out = cpmm_quote_out(
+        amount_in as u128,
+        in_reserve,
+        out_reserve,
+        pool.swap_fee_bps,
+    )?;
+    let amount_out_u64: u64 = amount_out
+        .try_into()
+        .map_err(|_| LiquidityError::MathOverflow)?;
+
+    if amount_out_u64 < min_out {
+        return Err(LiquidityError::SlippageExceeded.into());
+    }
+
+    // Executable cap: the output reserve's swappable portion must cover us.
+    let (swappable_a, swappable_b) = pool.swappable(real_a, real_b)?;
+    let out_swappable = if a_to_b { swappable_b } else { swappable_a };
+    if amount_out > out_swappable {
+        return Err(LiquidityError::Insolvent.into());
+    }
+
+    // ---- Persist liquidated loans + rewire band chains ----
+    persist_liquidations(accounts, &loans, &bands, program_id, pool_info.key)?;
+
+    // ---- Token transfers ----
+    let clock = Clock::get()?;
+    let pool_pda_seeds: &[&[u8]] = &[
+        POOL_SEED,
+        pool.mint_a.as_ref(),
+        pool.mint_b.as_ref(),
+        std::slice::from_ref(&pool.pool_bump),
+    ];
+    if a_to_b {
+        // user A → vault A
+        invoke(
+            &spl_token_2022::instruction::transfer_checked(
+                token_program_info.key,
+                user_a_info.key,
+                mint_a_info.key,
+                vault_a_info.key,
+                user_info.key,
+                &[],
+                amount_in,
+                mint_a_decimals,
+            )?,
+            &[
+                user_a_info.clone(),
+                mint_a_info.clone(),
+                vault_a_info.clone(),
+                user_info.clone(),
+            ],
+        )?;
+        // vault B → user B
+        invoke_signed(
+            &spl_token_2022::instruction::transfer_checked(
+                token_program_info.key,
+                vault_b_info.key,
+                mint_b_info.key,
+                user_b_info.key,
+                pool_info.key,
+                &[],
+                amount_out_u64,
+                mint_b_decimals,
+            )?,
+            &[
+                vault_b_info.clone(),
+                mint_b_info.clone(),
+                user_b_info.clone(),
+                pool_info.clone(),
+            ],
+            &[pool_pda_seeds],
+        )?;
+    } else {
+        // user B → vault B
+        invoke(
+            &spl_token_2022::instruction::transfer_checked(
+                token_program_info.key,
+                user_b_info.key,
+                mint_b_info.key,
+                vault_b_info.key,
+                user_info.key,
+                &[],
+                amount_in,
+                mint_b_decimals,
+            )?,
+            &[
+                user_b_info.clone(),
+                mint_b_info.clone(),
+                vault_b_info.clone(),
+                user_info.clone(),
+            ],
+        )?;
+        // vault A → user A
+        invoke_signed(
+            &spl_token_2022::instruction::transfer_checked(
+                token_program_info.key,
+                vault_a_info.key,
+                mint_a_info.key,
+                user_a_info.key,
+                pool_info.key,
+                &[],
+                amount_out_u64,
+                mint_a_decimals,
+            )?,
+            &[
+                vault_a_info.clone(),
+                mint_a_info.clone(),
+                user_a_info.clone(),
+                pool_info.clone(),
+            ],
+            &[pool_pda_seeds],
+        )?;
+    }
+
+    pool.last_update_slot = clock.slot;
+    let mut data = pool_info.try_borrow_mut_data()?;
+    pool.serialize(&mut &mut data[..])?;
+
+    msg!(
+        "Swap a_to_b={} amount_in={} amount_out={} liquidations={}",
+        a_to_b,
+        amount_in,
+        amount_out_u64,
+        liq_count
+    );
+    Ok(())
+}
+
+/// For each band, walk its supplied links in chain order. Survivors get
+/// rewired with prev/next pointing to the previous/next survivor.
+/// Liquidated links are zeroed (data wiped); their lamports remain
+/// recoverable via a future cleanup instruction. Liquidated loans are
+/// marked `STATUS_LIQUIDATED` with their amounts zeroed.
+fn persist_liquidations(
+    accounts: &[AccountInfo],
+    loans: &[LoanCtx],
+    bands: &[BandCtx],
+    _program_id: &Pubkey,
+    _pool_key: &Pubkey,
+) -> ProgramResult {
+    let clock = Clock::get()?;
+
+    for band in bands {
+        let band_info = &accounts[band.band_idx];
+        let mut band_state =
+            LoanIndexBand::try_from_slice(&band_info.try_borrow_data()?)
+                .map_err(|_| LiquidityError::AccountDataTooSmall)?;
+
+        let mut new_head = Pubkey::default();
+        let mut prev_pubkey = Pubkey::default();
+        let mut prev_link_idx_in_accts: Option<usize> = None;
+        let mut new_count: u32 = 0;
+        // Track new min/max trigger across surviving links.
+        let mut new_min_trigger: u128 = u128::MAX;
+        let mut new_max_trigger: u128 = 0;
+
+        for &link_idx in band.link_idxs.iter() {
+            // Find this link's entry in `loans` (1:1 with link_idxs in order).
+            let lc = loans
+                .iter()
+                .find(|l| l.link_idx == link_idx)
+                .ok_or(LiquidityError::InvalidLiquidationContext)?;
+
+            let link_info = &accounts[link_idx];
+            let loan_info = &accounts[lc.loan_idx];
+
+            if lc.liquidated {
+                // Mark Loan as liquidated with zeroed amounts (preserves the
+                // tombstone for off-chain auditability). Lamports remain in
+                // the account; borrower can reclaim later.
+                let mut loan = Loan::try_from_slice(&loan_info.try_borrow_data()?)
+                    .map_err(|_| LiquidityError::AccountDataTooSmall)?;
+                loan.collateral_amount = 0;
+                loan.debt_principal = 0;
+                loan.debt_accrued = 0;
+                loan.status = Loan::STATUS_LIQUIDATED;
+                loan.closed_slot = clock.slot;
+                let mut data = loan_info.try_borrow_mut_data()?;
+                loan.serialize(&mut &mut data[..])?;
+                // Zero the LoanLink data (it's no longer in any chain).
+                let mut data = link_info.try_borrow_mut_data()?;
+                for byte in data.iter_mut() {
+                    *byte = 0;
+                }
+                continue;
+            }
+
+            // Survivor: rewire prev/next.
+            let mut link =
+                LoanLink::try_from_slice(&link_info.try_borrow_data()?)
+                    .map_err(|_| LiquidityError::AccountDataTooSmall)?;
+            link.prev = prev_pubkey;
+            link.next = Pubkey::default();
+            {
+                let mut data = link_info.try_borrow_mut_data()?;
+                link.serialize(&mut &mut data[..])?;
+            }
+            // Update the previous survivor's `next` to point at us.
+            if let Some(prev_idx) = prev_link_idx_in_accts {
+                let prev_info = &accounts[prev_idx];
+                let mut prev_link = LoanLink::try_from_slice(
+                    &prev_info.try_borrow_data()?,
+                )
+                .map_err(|_| LiquidityError::AccountDataTooSmall)?;
+                prev_link.next = *link_info.key;
+                let mut data = prev_info.try_borrow_mut_data()?;
+                prev_link.serialize(&mut &mut data[..])?;
+            }
+            if new_count == 0 {
+                new_head = *link_info.key;
+            }
+            new_count += 1;
+            prev_pubkey = *link_info.key;
+            prev_link_idx_in_accts = Some(link_idx);
+            if link.trigger_price_wad < new_min_trigger {
+                new_min_trigger = link.trigger_price_wad;
+            }
+            if link.trigger_price_wad > new_max_trigger {
+                new_max_trigger = link.trigger_price_wad;
+            }
+        }
+
+        band_state.head_link = new_head;
+        band_state.tail_link = prev_pubkey;
+        band_state.count = new_count;
+        if new_count == 0 {
+            band_state.min_trigger_wad = u128::MAX;
+            band_state.max_trigger_wad = 0;
+        } else {
+            band_state.min_trigger_wad = new_min_trigger;
+            band_state.max_trigger_wad = new_max_trigger;
+        }
+        let mut data = band_info.try_borrow_mut_data()?;
+        band_state.serialize(&mut &mut data[..])?;
+    }
+    Ok(())
+}
+
+fn read_mint_decimals(info: &AccountInfo) -> Result<u8, LiquidityError> {
+    let data = info
+        .try_borrow_data()
+        .map_err(|_| LiquidityError::AccountDataTooSmall)?;
+    let state = StateWithExtensions::<Mint>::unpack(&data)
+        .map_err(|_| LiquidityError::InvalidPoolMint)?;
+    Ok(state.base.decimals)
+}
+
+fn read_token_amount(info: &AccountInfo) -> Result<u128, LiquidityError> {
+    let data = info
+        .try_borrow_data()
+        .map_err(|_| LiquidityError::AccountDataTooSmall)?;
+    let state = StateWithExtensions::<TokenAccount>::unpack(&data)
+        .map_err(|_| LiquidityError::InvalidVault)?;
+    Ok(state.base.amount as u128)
+}

@@ -150,6 +150,43 @@ pub enum LiquidityInstruction {
     ///                  the loan_link itself as a placeholder.
     /// 13. `[]`        Token program
     RepayLoan,
+
+    /// Swap with mandatory in-flight liquidation. See DESIGN.md §7.
+    ///
+    /// Caller supplies all bands+links+loans whose liquidation might be
+    /// triggered by the price move. The program iteratively (a) computes the
+    /// post-swap price, (b) finds the next supplied loan whose direction
+    /// matches and whose trigger has been crossed, (c) liquidates it, and
+    /// (d) recomputes. After the loop terminates, the swap is quoted on the
+    /// final accounted reserves and committed only if it satisfies the
+    /// user's `min_out` and the pool's executable cap.
+    ///
+    /// `band_link_counts[i]` = number of links (and loans) supplied for the
+    /// `i`-th band. The total tail account count is
+    /// `Σ (1 + 2 * band_link_counts[i])`.
+    ///
+    /// Accounts (fixed prefix):
+    /// 0. `[writable]` Pool
+    /// 1. `[writable]` Vault A
+    /// 2. `[writable]` Vault B
+    /// 3. `[writable]` User token A
+    /// 4. `[writable]` User token B
+    /// 5. `[]`         Mint A
+    /// 6. `[]`         Mint B
+    /// 7. `[signer]`   User
+    /// 8. `[]`         Token program
+    ///
+    /// Accounts (per band, repeated for each entry in `band_link_counts`):
+    ///   `[writable]` Band PDA
+    ///   `[writable]` LoanLink × K (in chain order: from band.head_link
+    ///                forward via .next pointers)
+    ///   `[writable]` Loan × K (matching the LoanLinks above)
+    Swap {
+        amount_in: u64,
+        min_out: u64,
+        a_to_b: bool,
+        band_link_counts: Vec<u8>,
+    },
 }
 
 #[cfg(not(feature = "no-entrypoint"))]
@@ -248,6 +285,22 @@ pub fn process_instruction(
         LiquidityInstruction::RepayLoan => {
             msg!("Instruction: RepayLoan");
             process_repay_loan(program_id, accounts)
+        }
+        LiquidityInstruction::Swap {
+            amount_in,
+            min_out,
+            a_to_b,
+            band_link_counts,
+        } => {
+            msg!("Instruction: Swap");
+            process_swap(
+                program_id,
+                accounts,
+                amount_in,
+                min_out,
+                a_to_b,
+                band_link_counts,
+            )
         }
     }
 }
