@@ -199,6 +199,30 @@ pub enum LiquidityInstruction {
     /// 8. `[]`         Token program
     ClaimProtocolFees,
 
+    /// Authority-only: rotate the pool authority. Set `new_authority =
+    /// Pubkey::default()` to permanently renounce.
+    ///
+    /// Accounts:
+    /// 0. `[writable]` Pool
+    /// 1. `[signer]`   Current authority
+    TransferAuthority { new_authority: Pubkey },
+
+    /// Authority-only: retune fee/liquidation/LTV/interest parameters
+    /// within the same bounds as `InitializePool`. Applies prospectively
+    /// (existing loans' trigger prices are not recomputed).
+    ///
+    /// Accounts:
+    /// 0. `[writable]` Pool
+    /// 1. `[signer]`   Authority
+    UpdatePoolSettings {
+        swap_fee_bps: u16,
+        protocol_fee_bps: u16,
+        liq_ratio_bps: u16,
+        liq_penalty_bps: u16,
+        max_ltv_bps: u16,
+        interest_rate_bps_per_year: u16,
+    },
+
     Swap {
         amount_in: u64,
         min_out: u64,
@@ -316,6 +340,30 @@ pub fn process_instruction(
         LiquidityInstruction::ClaimProtocolFees => {
             msg!("Instruction: ClaimProtocolFees");
             process_claim_protocol_fees(program_id, accounts)
+        }
+        LiquidityInstruction::TransferAuthority { new_authority } => {
+            msg!("Instruction: TransferAuthority");
+            process_transfer_authority(program_id, accounts, new_authority)
+        }
+        LiquidityInstruction::UpdatePoolSettings {
+            swap_fee_bps,
+            protocol_fee_bps,
+            liq_ratio_bps,
+            liq_penalty_bps,
+            max_ltv_bps,
+            interest_rate_bps_per_year,
+        } => {
+            msg!("Instruction: UpdatePoolSettings");
+            process_update_pool_settings(
+                program_id,
+                accounts,
+                swap_fee_bps,
+                protocol_fee_bps,
+                liq_ratio_bps,
+                liq_penalty_bps,
+                max_ltv_bps,
+                interest_rate_bps_per_year,
+            )
         }
         LiquidityInstruction::Swap {
             amount_in,

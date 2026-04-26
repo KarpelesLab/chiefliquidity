@@ -41,12 +41,12 @@ pub const LP_MINT_DECIMALS: u8 = 9;
 
 // ---- Parameter bounds ----
 
-const MIN_LIQ_RATIO_BPS: u16 = 10_100; // 101%
-const MAX_LIQ_RATIO_BPS: u16 = 30_000; // 300%
-const MAX_SWAP_FEE_BPS: u16 = 1_000; // 10%
-const MAX_LIQ_PENALTY_BPS: u16 = 2_000; // 20%
-const MAX_INTEREST_RATE_BPS: u16 = 10_000; // 100% APR
-const MIN_LTV_BPS: u16 = 100; // 1%
+pub const MIN_LIQ_RATIO_BPS: u16 = 10_100; // 101%
+pub const MAX_LIQ_RATIO_BPS: u16 = 30_000; // 300%
+pub const MAX_SWAP_FEE_BPS: u16 = 1_000; // 10%
+pub const MAX_LIQ_PENALTY_BPS: u16 = 2_000; // 20%
+pub const MAX_INTEREST_RATE_BPS: u16 = 10_000; // 100% APR
+pub const MIN_LTV_BPS: u16 = 100; // 1%
 
 /// Initialize a new liquidity pool.
 ///
@@ -271,7 +271,7 @@ pub fn process_initialize_pool(
 
 // ---- helpers ----
 
-fn validate_params(
+pub fn validate_params(
     swap_fee_bps: u16,
     protocol_fee_bps: u16,
     liq_ratio_bps: u16,
