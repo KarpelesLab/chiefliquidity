@@ -678,6 +678,80 @@ impl TestEnv {
             .await
     }
 
+    // ---- Admin helpers ----
+
+    pub async fn transfer_authority(
+        &mut self,
+        authority: &Keypair,
+        new_authority: Pubkey,
+    ) -> Result<(), TransportError> {
+        let data = LiquidityInstruction::TransferAuthority { new_authority };
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(self.pool_pda().0, false),
+                AccountMeta::new_readonly(authority.pubkey(), true),
+            ],
+            data: borsh::to_vec(&data).unwrap(),
+        };
+        self.send_with_new_blockhash(&[ix], &[authority]).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_pool_settings(
+        &mut self,
+        authority: &Keypair,
+        params: &PoolParams,
+    ) -> Result<(), TransportError> {
+        let data = LiquidityInstruction::UpdatePoolSettings {
+            swap_fee_bps: params.swap_fee_bps,
+            protocol_fee_bps: params.protocol_fee_bps,
+            liq_ratio_bps: params.liq_ratio_bps,
+            liq_penalty_bps: params.liq_penalty_bps,
+            max_ltv_bps: params.max_ltv_bps,
+            interest_base_bps_per_year: params.interest_base_bps_per_year,
+            interest_slope1_bps_per_year: params.interest_slope1_bps_per_year,
+            interest_slope2_bps_per_year: params.interest_slope2_bps_per_year,
+            interest_kink_bps: params.interest_kink_bps,
+        };
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(self.pool_pda().0, false),
+                AccountMeta::new_readonly(self.vault_a_pda().0, false),
+                AccountMeta::new_readonly(self.vault_b_pda().0, false),
+                AccountMeta::new_readonly(authority.pubkey(), true),
+            ],
+            data: borsh::to_vec(&data).unwrap(),
+        };
+        self.send_with_new_blockhash(&[ix], &[authority]).await
+    }
+
+    pub async fn claim_protocol_fees(
+        &mut self,
+        authority: &Keypair,
+        dest_a: &Pubkey,
+        dest_b: &Pubkey,
+    ) -> Result<(), TransportError> {
+        let data = LiquidityInstruction::ClaimProtocolFees;
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(self.pool_pda().0, false),
+                AccountMeta::new(self.vault_a_pda().0, false),
+                AccountMeta::new(self.vault_b_pda().0, false),
+                AccountMeta::new(*dest_a, false),
+                AccountMeta::new(*dest_b, false),
+                AccountMeta::new_readonly(self.mint_a.pubkey(), false),
+                AccountMeta::new_readonly(self.mint_b.pubkey(), false),
+                AccountMeta::new_readonly(authority.pubkey(), true),
+                AccountMeta::new_readonly(self.token_program, false),
+            ],
+            data: borsh::to_vec(&data).unwrap(),
+        };
+        self.send_with_new_blockhash(&[ix], &[authority]).await
+    }
+
     /// Build + submit a ClaimLiquidatedRent instruction.
     pub async fn claim_liquidated_rent(
         &mut self,
