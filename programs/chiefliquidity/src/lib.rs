@@ -207,6 +207,16 @@ pub enum LiquidityInstruction {
     /// 1. `[signer]`   Current authority
     TransferAuthority { new_authority: Pubkey },
 
+    /// Borrower-callable: reclaim the rent on a `Loan` (and its tombstoned
+    /// `LoanLink`) that was liquidated mid-swap.
+    ///
+    /// Accounts:
+    /// 0. `[writable]` Loan (status=LIQUIDATED, drained + zeroed)
+    /// 1. `[writable]` LoanLink (drained; data already zero from swap)
+    /// 2. `[writable, signer]` Borrower (lamport recipient; must match
+    ///                  `Loan.borrower`)
+    ClaimLiquidatedRent,
+
     /// Authority-only: retune fee/liquidation/LTV/interest parameters
     /// within the same bounds as `InitializePool`. Applies prospectively
     /// (existing loans' trigger prices are not recomputed).
@@ -344,6 +354,10 @@ pub fn process_instruction(
         LiquidityInstruction::TransferAuthority { new_authority } => {
             msg!("Instruction: TransferAuthority");
             process_transfer_authority(program_id, accounts, new_authority)
+        }
+        LiquidityInstruction::ClaimLiquidatedRent => {
+            msg!("Instruction: ClaimLiquidatedRent");
+            process_claim_liquidated_rent(program_id, accounts)
         }
         LiquidityInstruction::UpdatePoolSettings {
             swap_fee_bps,
