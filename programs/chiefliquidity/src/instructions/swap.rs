@@ -403,6 +403,35 @@ pub fn process_swap(
         return Err(LiquidityError::Insolvent.into());
     }
 
+    // ---- Protocol fee skim ----
+    // Total fee charged on the input side:
+    //   fee_taken = amount_in * swap_fee_bps / BPS_DENOM
+    // Protocol's share (rest stays as LP yield via implicit accounted growth):
+    //   protocol_portion = fee_taken * protocol_fee_bps / swap_fee_bps
+    let protocol_portion: u64 = if pool.swap_fee_bps == 0 || pool.protocol_fee_bps == 0 {
+        0
+    } else {
+        let fee_taken = (amount_in as u128) * (pool.swap_fee_bps as u128) / BPS_DENOM;
+        let portion =
+            fee_taken * (pool.protocol_fee_bps as u128) / (pool.swap_fee_bps as u128);
+        portion
+            .try_into()
+            .map_err(|_| LiquidityError::MathOverflow)?
+    };
+    if protocol_portion > 0 {
+        if a_to_b {
+            pool.protocol_fees_a = pool
+                .protocol_fees_a
+                .checked_add(protocol_portion)
+                .ok_or(LiquidityError::MathOverflow)?;
+        } else {
+            pool.protocol_fees_b = pool
+                .protocol_fees_b
+                .checked_add(protocol_portion)
+                .ok_or(LiquidityError::MathOverflow)?;
+        }
+    }
+
     // ---- Final boundary check: post-swap price's band must be on the
     // claimed side of `band_boundary`. If the cascade pushed the price past
     // the caller's claim, more bands could have triggered. Revert. ----

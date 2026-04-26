@@ -164,9 +164,10 @@ impl Pool {
     }
 
     /// LP-owned share of each side, given current vault balances.
-    /// Excludes borrower-deposited collateral (DESIGN.md §2).
+    /// Excludes borrower-deposited collateral (DESIGN.md §2) and the
+    /// protocol's accumulated fee share.
     ///
-    /// `swappable_x = real_x - total_collateral_x`
+    /// `swappable_x = real_x - total_collateral_x - protocol_fees_x`
     pub fn swappable(
         &self,
         real_a: u128,
@@ -174,9 +175,13 @@ impl Pool {
     ) -> Result<(u128, u128), LiquidityError> {
         let a = real_a
             .checked_sub(self.total_collateral_a)
+            .ok_or(LiquidityError::MathUnderflow)?
+            .checked_sub(self.protocol_fees_a as u128)
             .ok_or(LiquidityError::MathUnderflow)?;
         let b = real_b
             .checked_sub(self.total_collateral_b)
+            .ok_or(LiquidityError::MathUnderflow)?
+            .checked_sub(self.protocol_fees_b as u128)
             .ok_or(LiquidityError::MathUnderflow)?;
         Ok((a, b))
     }
@@ -738,6 +743,20 @@ mod tests {
         p.total_collateral_b = 0;
         let (a, b) = p.swappable(1050, 5000).unwrap();
         assert_eq!((a, b), (1000, 5000));
+    }
+
+    #[test]
+    fn pool_swappable_excludes_protocol_fees() {
+        let mut p = fake_pool();
+        p.total_collateral_a = 0;
+        p.protocol_fees_a = 25;
+        p.protocol_fees_b = 100;
+        let (a, b) = p.swappable(1000, 5000).unwrap();
+        assert_eq!((a, b), (975, 4900));
+        // accounted excludes both (collateral + protocol fees) but adds debt
+        p.total_debt_b = 500;
+        let (acc_a, acc_b) = p.accounted(1000, 5000).unwrap();
+        assert_eq!((acc_a, acc_b), (975, 4900 + 500));
     }
 
     /// Confirm the corrected LEN constants, since DESIGN.md had arithmetic errors.

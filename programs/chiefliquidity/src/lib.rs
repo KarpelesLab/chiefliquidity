@@ -181,6 +181,24 @@ pub enum LiquidityInstruction {
     ///   `[writable]` LoanLink × K (in chain order: from band.head_link
     ///                forward via .next pointers)
     ///   `[writable]` Loan × K (matching the LoanLinks above)
+    /// Authority-only: drain accumulated protocol fees from the vaults to
+    /// the authority's token accounts. Resets `protocol_fees_a` and
+    /// `protocol_fees_b` to 0. No-op if both are already 0.
+    ///
+    /// Reverts if pool authority has been renounced.
+    ///
+    /// Accounts:
+    /// 0. `[writable]` Pool
+    /// 1. `[writable]` Vault A
+    /// 2. `[writable]` Vault B
+    /// 3. `[writable]` Authority's token A account
+    /// 4. `[writable]` Authority's token B account
+    /// 5. `[]`         Mint A
+    /// 6. `[]`         Mint B
+    /// 7. `[signer]`   Authority
+    /// 8. `[]`         Token program
+    ClaimProtocolFees,
+
     Swap {
         amount_in: u64,
         min_out: u64,
@@ -294,6 +312,10 @@ pub fn process_instruction(
         LiquidityInstruction::RepayLoan => {
             msg!("Instruction: RepayLoan");
             process_repay_loan(program_id, accounts)
+        }
+        LiquidityInstruction::ClaimProtocolFees => {
+            msg!("Instruction: ClaimProtocolFees");
+            process_claim_protocol_fees(program_id, accounts)
         }
         LiquidityInstruction::Swap {
             amount_in,
