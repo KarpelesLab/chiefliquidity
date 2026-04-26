@@ -45,8 +45,14 @@ pub const MIN_LIQ_RATIO_BPS: u16 = 10_100; // 101%
 pub const MAX_LIQ_RATIO_BPS: u16 = 30_000; // 300%
 pub const MAX_SWAP_FEE_BPS: u16 = 1_000; // 10%
 pub const MAX_LIQ_PENALTY_BPS: u16 = 2_000; // 20%
-pub const MAX_INTEREST_RATE_BPS: u16 = 10_000; // 100% APR
 pub const MIN_LTV_BPS: u16 = 100; // 1%
+
+// Interest model bounds (all in bps-per-year, except kink which is bps of utilization).
+pub const MAX_INTEREST_BASE_BPS: u16 = 10_000; // 100% APR base
+pub const MAX_INTEREST_SLOPE1_BPS: u16 = 10_000; // 100% APR at kink
+pub const MAX_INTEREST_SLOPE2_BPS: u16 = 65_000; // ~650% APR over kink
+pub const MIN_KINK_BPS: u16 = 100; // 1% utilization
+pub const MAX_KINK_BPS: u16 = 9_900; // 99% utilization
 
 /// Initialize a new liquidity pool.
 ///
@@ -61,6 +67,7 @@ pub const MIN_LTV_BPS: u16 = 100; // 1%
 /// 7. `[]`        System program
 /// 8. `[]`        Token program (SPL Token or Token 2022)
 /// 9. `[]`        Rent sysvar
+#[allow(clippy::too_many_arguments)]
 pub fn process_initialize_pool(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -69,7 +76,10 @@ pub fn process_initialize_pool(
     liq_ratio_bps: u16,
     liq_penalty_bps: u16,
     max_ltv_bps: u16,
-    interest_rate_bps_per_year: u16,
+    interest_base_bps_per_year: u16,
+    interest_slope1_bps_per_year: u16,
+    interest_slope2_bps_per_year: u16,
+    interest_kink_bps: u16,
 ) -> ProgramResult {
     let it = &mut accounts.iter();
 
@@ -118,7 +128,10 @@ pub fn process_initialize_pool(
         liq_ratio_bps,
         liq_penalty_bps,
         max_ltv_bps,
-        interest_rate_bps_per_year,
+        interest_base_bps_per_year,
+        interest_slope1_bps_per_year,
+        interest_slope2_bps_per_year,
+        interest_kink_bps,
     )?;
 
     // ---- PDA derivations ----
@@ -242,8 +255,14 @@ pub fn process_initialize_pool(
         liq_ratio_bps,
         liq_penalty_bps,
         max_ltv_bps,
-        interest_rate_bps_per_year,
-        _lending_pad: [0; 8],
+        _lending_pad: [0; 2],
+        interest_base_bps_per_year,
+        interest_slope1_bps_per_year,
+        interest_slope2_bps_per_year,
+        interest_kink_bps,
+        borrow_index_a_wad: crate::math::WAD,
+        borrow_index_b_wad: crate::math::WAD,
+        last_index_update_slot: clock.slot,
         head_fall: Pubkey::default(),
         head_rise: Pubkey::default(),
         band_count_fall: 0,
@@ -271,13 +290,17 @@ pub fn process_initialize_pool(
 
 // ---- helpers ----
 
+#[allow(clippy::too_many_arguments)]
 pub fn validate_params(
     swap_fee_bps: u16,
     protocol_fee_bps: u16,
     liq_ratio_bps: u16,
     liq_penalty_bps: u16,
     max_ltv_bps: u16,
-    interest_rate_bps_per_year: u16,
+    interest_base_bps_per_year: u16,
+    interest_slope1_bps_per_year: u16,
+    interest_slope2_bps_per_year: u16,
+    interest_kink_bps: u16,
 ) -> ProgramResult {
     if swap_fee_bps > MAX_SWAP_FEE_BPS {
         return Err(LiquidityError::SettingExceedsMaximum.into());
@@ -291,9 +314,6 @@ pub fn validate_params(
     if liq_penalty_bps > MAX_LIQ_PENALTY_BPS {
         return Err(LiquidityError::SettingExceedsMaximum.into());
     }
-    if interest_rate_bps_per_year > MAX_INTEREST_RATE_BPS {
-        return Err(LiquidityError::SettingExceedsMaximum.into());
-    }
     if max_ltv_bps < MIN_LTV_BPS {
         return Err(LiquidityError::SettingExceedsMaximum.into());
     }
@@ -302,6 +322,20 @@ pub fn validate_params(
     //   max_ltv < BPS_DENOM^2 / liq_ratio
     let max_safe_ltv = (BPS_DENOM * BPS_DENOM) / liq_ratio_bps as u128;
     if (max_ltv_bps as u128) >= max_safe_ltv {
+        return Err(LiquidityError::SettingExceedsMaximum.into());
+    }
+
+    // Interest model bounds
+    if interest_base_bps_per_year > MAX_INTEREST_BASE_BPS {
+        return Err(LiquidityError::SettingExceedsMaximum.into());
+    }
+    if interest_slope1_bps_per_year > MAX_INTEREST_SLOPE1_BPS {
+        return Err(LiquidityError::SettingExceedsMaximum.into());
+    }
+    if interest_slope2_bps_per_year > MAX_INTEREST_SLOPE2_BPS {
+        return Err(LiquidityError::SettingExceedsMaximum.into());
+    }
+    if interest_kink_bps < MIN_KINK_BPS || interest_kink_bps > MAX_KINK_BPS {
         return Err(LiquidityError::SettingExceedsMaximum.into());
     }
     Ok(())

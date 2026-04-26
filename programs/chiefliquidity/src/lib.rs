@@ -45,7 +45,14 @@ pub enum LiquidityInstruction {
         liq_ratio_bps: u16,
         liq_penalty_bps: u16,
         max_ltv_bps: u16,
-        interest_rate_bps_per_year: u16,
+        /// Base APR (bps) at zero utilization.
+        interest_base_bps_per_year: u16,
+        /// Slope from zero to kink utilization (bps APR added at kink).
+        interest_slope1_bps_per_year: u16,
+        /// Slope from kink to 100% utilization (bps APR added over kink).
+        interest_slope2_bps_per_year: u16,
+        /// Kink point in bps of utilization (e.g. 8000 = 80%).
+        interest_kink_bps: u16,
     },
 
     /// Deposit `amount_a_max` of A and `amount_b_max` of B (or proportional
@@ -219,18 +226,26 @@ pub enum LiquidityInstruction {
 
     /// Authority-only: retune fee/liquidation/LTV/interest parameters
     /// within the same bounds as `InitializePool`. Applies prospectively
-    /// (existing loans' trigger prices are not recomputed).
+    /// (existing loans' trigger prices are not recomputed). The borrow
+    /// indexes are bumped at the **old** rate before the new params take
+    /// effect, so accrued-but-unrealized interest is captured at the
+    /// previous curve.
     ///
     /// Accounts:
     /// 0. `[writable]` Pool
-    /// 1. `[signer]`   Authority
+    /// 1. `[]` Vault A (read-only — needed for utilization)
+    /// 2. `[]` Vault B (read-only)
+    /// 3. `[signer]`   Authority
     UpdatePoolSettings {
         swap_fee_bps: u16,
         protocol_fee_bps: u16,
         liq_ratio_bps: u16,
         liq_penalty_bps: u16,
         max_ltv_bps: u16,
-        interest_rate_bps_per_year: u16,
+        interest_base_bps_per_year: u16,
+        interest_slope1_bps_per_year: u16,
+        interest_slope2_bps_per_year: u16,
+        interest_kink_bps: u16,
     },
 
     Swap {
@@ -285,7 +300,10 @@ pub fn process_instruction(
             liq_ratio_bps,
             liq_penalty_bps,
             max_ltv_bps,
-            interest_rate_bps_per_year,
+            interest_base_bps_per_year,
+            interest_slope1_bps_per_year,
+            interest_slope2_bps_per_year,
+            interest_kink_bps,
         } => {
             msg!("Instruction: InitializePool");
             process_initialize_pool(
@@ -296,7 +314,10 @@ pub fn process_instruction(
                 liq_ratio_bps,
                 liq_penalty_bps,
                 max_ltv_bps,
-                interest_rate_bps_per_year,
+                interest_base_bps_per_year,
+                interest_slope1_bps_per_year,
+                interest_slope2_bps_per_year,
+                interest_kink_bps,
             )
         }
         LiquidityInstruction::AddLiquidity {
@@ -365,7 +386,10 @@ pub fn process_instruction(
             liq_ratio_bps,
             liq_penalty_bps,
             max_ltv_bps,
-            interest_rate_bps_per_year,
+            interest_base_bps_per_year,
+            interest_slope1_bps_per_year,
+            interest_slope2_bps_per_year,
+            interest_kink_bps,
         } => {
             msg!("Instruction: UpdatePoolSettings");
             process_update_pool_settings(
@@ -376,7 +400,10 @@ pub fn process_instruction(
                 liq_ratio_bps,
                 liq_penalty_bps,
                 max_ltv_bps,
-                interest_rate_bps_per_year,
+                interest_base_bps_per_year,
+                interest_slope1_bps_per_year,
+                interest_slope2_bps_per_year,
+                interest_kink_bps,
             )
         }
         LiquidityInstruction::Swap {

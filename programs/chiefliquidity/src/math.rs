@@ -87,35 +87,125 @@ pub fn mul_div(a: u128, b: u128, c: u128) -> Result<u128, LiquidityError> {
     q.to_u128().ok_or(LiquidityError::MathOverflow)
 }
 
-// ===== Interest accrual =====
+// ===== Interest model (utilization-based, per-side) =====
+//
+// We use a monotonic per-side borrow index, WAD-scaled, that grows over
+// time at a rate determined by the side's utilization. Loans store the
+// index snapshot at open; total owed at any future moment is
+// `principal * current_index / snapshot_index`.
+//
+// Rate curve (Aave-style with one kink):
+//   below kink: rate = base + slope1 * util / kink
+//   at  kink:   rate = base + slope1
+//   above kink: rate = base + slope1 + slope2 * (util - kink) / (1 - kink)
+//
+// All bps inputs are in "bps per year" units (10000 bps = 100% APR).
+// Utilization is `total_debt / accounted`, returned as a u128 in WAD scale
+// (so 0.8 utilization → 8e17).
 
-/// Linear per-slot accrual: `accrued += principal * rate_bps * Δslots /
-/// (BPS_DENOM * SLOTS_PER_YEAR)`.
+/// Compute utilization as a WAD-scaled u128. Returns 0 when accounted is 0
+/// (an empty pool has no utilization). Caps at WAD if debt exceeds accounted
+/// (shouldn't happen in normal operation but a safe ceiling).
+pub fn utilization_wad(debt: u128, accounted: u128) -> u128 {
+    if accounted == 0 {
+        return 0;
+    }
+    let util_u256 = U256::from_u128(debt)
+        .checked_mul(WAD_U256)
+        .map(|n| n / U256::from_u128(accounted))
+        .unwrap_or(WAD_U256);
+    util_u256.to_u128().unwrap_or(WAD).min(WAD)
+}
+
+/// Compute borrow rate in WAD-per-year units given utilization (WAD) and the
+/// curve params (all in bps).
 ///
-/// Returns the *new* total accrued value (including the prior `accrued_so_far`).
-pub fn accrue_interest(
-    principal: u128,
-    accrued_so_far: u128,
-    rate_bps_per_year: u16,
+/// `kink_bps` is the utilization (in bps of utilization, NOT of the year)
+/// at which the curve switches to the steep slope. e.g. 8000 = 80%.
+pub fn compute_borrow_rate_wad_per_year(
+    util_wad: u128,
+    base_bps_per_year: u16,
+    slope1_bps_per_year: u16,
+    slope2_bps_per_year: u16,
+    kink_bps: u16,
+) -> Result<u128, LiquidityError> {
+    let kink_wad = (kink_bps as u128)
+        .checked_mul(WAD)
+        .ok_or(LiquidityError::MathOverflow)?
+        / BPS_DENOM;
+    if kink_wad == 0 {
+        return Err(LiquidityError::SettingExceedsMaximum);
+    }
+
+    let base = bps_to_wad(base_bps_per_year);
+    let slope1 = bps_to_wad(slope1_bps_per_year);
+    let slope2 = bps_to_wad(slope2_bps_per_year);
+
+    if util_wad <= kink_wad {
+        // base + slope1 * util / kink
+        let inc = mul_div(slope1, util_wad, kink_wad)?;
+        base.checked_add(inc).ok_or(LiquidityError::MathOverflow)
+    } else {
+        // base + slope1 + slope2 * (util - kink) / (WAD - kink)
+        let above = util_wad - kink_wad;
+        let span = WAD - kink_wad;
+        let inc = mul_div(slope2, above, span)?;
+        base.checked_add(slope1)
+            .and_then(|v| v.checked_add(inc))
+            .ok_or(LiquidityError::MathOverflow)
+    }
+}
+
+fn bps_to_wad(bps: u16) -> u128 {
+    (bps as u128) * (WAD / BPS_DENOM)
+}
+
+/// Linear per-slot bump: `index *= 1 + rate_per_slot * slots_elapsed`.
+/// rate_per_slot = rate_per_year / SLOTS_PER_YEAR.
+///
+/// Returns the new index. Compounding happens between bumps (each call
+/// integrates over `slots_elapsed` at constant rate); within a bump the
+/// approximation is linear, which under-estimates true e^(rt) by a small
+/// amount for long inactive windows. Acceptable for v1.
+pub fn bump_index_wad(
+    current_index_wad: u128,
+    rate_wad_per_year: u128,
     slots_elapsed: u64,
 ) -> Result<u128, LiquidityError> {
-    if rate_bps_per_year == 0 || slots_elapsed == 0 || principal == 0 {
-        return Ok(accrued_so_far);
+    if rate_wad_per_year == 0 || slots_elapsed == 0 {
+        return Ok(current_index_wad);
     }
-    let delta_num = U256::from_u128(principal)
-        .checked_mul(U256::from_u128(rate_bps_per_year as u128))
+    // delta = index * rate_per_year * slots / (SLOTS_PER_YEAR * WAD)
+    let num = U256::from_u128(current_index_wad)
+        .checked_mul(U256::from_u128(rate_wad_per_year))
         .ok_or(LiquidityError::MathOverflow)?
         .checked_mul(U256::from_u128(slots_elapsed as u128))
         .ok_or(LiquidityError::MathOverflow)?;
-    let delta_denom = U256::from_u128(BPS_DENOM)
-        .checked_mul(U256::from_u128(SLOTS_PER_YEAR as u128))
+    let denom = U256::from_u128(SLOTS_PER_YEAR as u128)
+        .checked_mul(WAD_U256)
         .ok_or(LiquidityError::MathOverflow)?;
-    let delta = (delta_num / delta_denom)
+    let delta = (num / denom)
         .to_u128()
         .ok_or(LiquidityError::MathOverflow)?;
-    accrued_so_far
+    current_index_wad
         .checked_add(delta)
         .ok_or(LiquidityError::MathOverflow)
+}
+
+/// Compute current owed: `principal * current_index / snapshot_index`.
+pub fn owed_from_index(
+    principal: u128,
+    snapshot_index_wad: u128,
+    current_index_wad: u128,
+) -> Result<u128, LiquidityError> {
+    if snapshot_index_wad == 0 {
+        return Err(LiquidityError::MathOverflow);
+    }
+    if current_index_wad < snapshot_index_wad {
+        // Index can only grow; this is an invariant violation.
+        return Err(LiquidityError::MathUnderflow);
+    }
+    mul_div(principal, current_index_wad, snapshot_index_wad)
 }
 
 // ===== AMM quoting =====
@@ -538,27 +628,92 @@ mod tests {
     }
 
     #[test]
-    fn test_accrue_interest_zero_inputs() {
-        assert_eq!(accrue_interest(1000, 5, 0, 1000).unwrap(), 5);
-        assert_eq!(accrue_interest(1000, 5, 100, 0).unwrap(), 5);
-        assert_eq!(accrue_interest(0, 5, 100, 1000).unwrap(), 5);
+    fn test_utilization_basic() {
+        assert_eq!(utilization_wad(0, 1000), 0);
+        assert_eq!(utilization_wad(500, 1000), WAD / 2);
+        assert_eq!(utilization_wad(1000, 1000), WAD);
+        // Empty pool
+        assert_eq!(utilization_wad(0, 0), 0);
+        // Over-utilization (shouldn't happen, but cap at WAD)
+        assert_eq!(utilization_wad(1500, 1000), WAD);
     }
 
     #[test]
-    fn test_accrue_interest_basic() {
-        // principal = 100_000_000, rate = 1000 bps = 10% APR,
-        // slots_elapsed = SLOTS_PER_YEAR → 1 year of interest.
-        // accrual = 100_000_000 * 1000 * 78_840_000 / (10000 * 78_840_000)
-        //         = 100_000_000 * 1000 / 10000 = 10_000_000 → 10% of principal.
-        let r = accrue_interest(100_000_000, 0, 1000, SLOTS_PER_YEAR).unwrap();
-        assert_eq!(r, 10_000_000);
+    fn test_borrow_rate_curve() {
+        // base=0, slope1=400 bps (4%), slope2=30000 bps (300%), kink=8000 (80%)
+        let base = 0u16;
+        let s1 = 400u16;
+        let s2 = 30_000u16;
+        let kink = 8000u16;
+
+        // At 0% util → base = 0
+        let r0 = compute_borrow_rate_wad_per_year(0, base, s1, s2, kink).unwrap();
+        assert_eq!(r0, 0);
+
+        // At kink (80% util) → base + slope1 = 4% APR = 0.04 WAD
+        let kink_util = (kink as u128) * WAD / BPS_DENOM;
+        let r_kink =
+            compute_borrow_rate_wad_per_year(kink_util, base, s1, s2, kink).unwrap();
+        // 4% APR in WAD = 0.04e18 = 4e16
+        assert_eq!(r_kink, 40_000_000_000_000_000);
+
+        // At 100% util → base + slope1 + slope2 = 304% APR = 3.04 WAD
+        let r_full =
+            compute_borrow_rate_wad_per_year(WAD, base, s1, s2, kink).unwrap();
+        assert_eq!(r_full, 3_040_000_000_000_000_000);
+
+        // At 50% util (below kink) → 0 + 400 * (50/80) = 250 bps = 2.5% APR
+        let half = WAD / 2;
+        let r_half = compute_borrow_rate_wad_per_year(half, base, s1, s2, kink).unwrap();
+        // 0.025 WAD = 2.5e16
+        assert_eq!(r_half, 25_000_000_000_000_000);
     }
 
     #[test]
-    fn test_accrue_interest_partial_year() {
-        // Half a year, 10% APR, principal = 100_000_000 → 5_000_000.
-        let r = accrue_interest(100_000_000, 0, 1000, SLOTS_PER_YEAR / 2).unwrap();
-        assert_eq!(r, 5_000_000);
+    fn test_borrow_rate_curve_above_kink() {
+        // base=0, slope1=400, slope2=30000, kink=8000
+        let kink = 8000u16;
+        let s1 = 400u16;
+        let s2 = 30_000u16;
+        // At 90% util → past kink. (90-80)/(100-80) = 0.5 of slope2 region.
+        // rate = 0 + 4% + 50% * 300% = 4% + 150% = 154% APR
+        let util = 9 * WAD / 10;
+        let r = compute_borrow_rate_wad_per_year(util, 0, s1, s2, kink).unwrap();
+        assert_eq!(r, 1_540_000_000_000_000_000);
+    }
+
+    #[test]
+    fn test_bump_index_one_year_at_ten_percent() {
+        // Index starts at WAD, rate = 10% APR, slots = 1 year.
+        // After: index = 1.1 WAD
+        let rate = WAD / 10; // 0.1 WAD/year = 10% APR
+        let r = bump_index_wad(WAD, rate, SLOTS_PER_YEAR).unwrap();
+        assert_eq!(r, 11 * WAD / 10);
+    }
+
+    #[test]
+    fn test_bump_index_zero_inputs() {
+        assert_eq!(bump_index_wad(WAD, 0, 1000).unwrap(), WAD);
+        assert_eq!(bump_index_wad(WAD, WAD / 10, 0).unwrap(), WAD);
+    }
+
+    #[test]
+    fn test_owed_from_index() {
+        // Loan opens at index=1.0 WAD with principal 100. Index grows to 1.5 WAD.
+        // Owed = 100 * 1.5 / 1.0 = 150
+        let principal = 100u128;
+        let snap = WAD;
+        let cur = 3 * WAD / 2;
+        assert_eq!(owed_from_index(principal, snap, cur).unwrap(), 150);
+    }
+
+    #[test]
+    fn test_owed_rejects_index_regression() {
+        // Index can never go down — assert we error rather than silently underflow.
+        assert_eq!(
+            owed_from_index(100, WAD, WAD - 1),
+            Err(LiquidityError::MathUnderflow)
+        );
     }
 
     #[test]

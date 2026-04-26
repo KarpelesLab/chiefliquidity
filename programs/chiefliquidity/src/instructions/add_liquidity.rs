@@ -85,6 +85,11 @@ pub fn process_add_liquidity(
     let real_a = read_token_amount(vault_a_info)?;
     let real_b = read_token_amount(vault_b_info)?;
 
+    // Bump indexes before we read accounted reserves: deposits change
+    // utilization, so we want the elapsed period accrued at the previous
+    // utilization first.
+    pool.bump_indexes(real_a, real_b, Clock::get()?.slot)?;
+
     // accounted_x = (real_x - total_collateral_x) + total_debt_x —
     // collateral is in the vault but earmarked, not part of LP claim.
     let (accounted_a, accounted_b) = pool.accounted(real_a, real_b)?;

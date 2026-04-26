@@ -85,6 +85,11 @@ pub fn process_remove_liquidity(
         return Err(LiquidityError::MathUnderflow.into());
     }
 
+    // Capitalize accrued interest into the indexes before computing the
+    // LP's proportional share — withdrawals shrink the pool's accounted
+    // reserves, which would change the next instruction's utilization.
+    pool.bump_indexes(real_a, real_b, Clock::get()?.slot)?;
+
     let (accounted_a, accounted_b) = pool.accounted(real_a, real_b)?;
     let (swappable_a, swappable_b) = pool.swappable(real_a, real_b)?;
 

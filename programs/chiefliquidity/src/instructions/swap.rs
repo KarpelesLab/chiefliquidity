@@ -274,6 +274,11 @@ pub fn process_swap(
     let mint_b_decimals = read_mint_decimals(mint_b_info)?;
     let real_a = read_token_amount(vault_a_info)?;
     let real_b = read_token_amount(vault_b_info)?;
+    // Bump per-side borrow indexes once at swap entry. Liquidations
+    // happening below remove principal from total_debt (the index isn't
+    // touched again — by definition liquidations forfeit accrued interest
+    // since the debt is written off, not paid back).
+    pool.bump_indexes(real_a, real_b, Clock::get()?.slot)?;
     let (mut accounted_a, mut accounted_b) = pool.accounted(real_a, real_b)?;
     if accounted_a == 0 || accounted_b == 0 {
         return Err(LiquidityError::ZeroReserves.into());
@@ -621,7 +626,6 @@ fn persist_liquidations(
                     .map_err(|_| LiquidityError::AccountDataTooSmall)?;
                 loan.collateral_amount = 0;
                 loan.debt_principal = 0;
-                loan.debt_accrued = 0;
                 loan.status = Loan::STATUS_LIQUIDATED;
                 loan.closed_slot = clock.slot;
                 let mut data = loan_info.try_borrow_mut_data()?;

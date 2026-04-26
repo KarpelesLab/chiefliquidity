@@ -24,7 +24,7 @@ use spl_token_2022::{
 
 use crate::{
     error::LiquidityError,
-    math::{accrue_interest, LoanSides, TriggerDirection},
+    math::{LoanSides, TriggerDirection},
     state::{
         bitmap_clear, is_valid_token_program, Loan, LoanIndexBand, LoanLink, Pool,
         POOL_SEED,
@@ -126,19 +126,13 @@ pub fn process_repay_loan(
 
     let clock = Clock::get()?;
 
-    // ---- Accrue interest ----
-    let slots_elapsed = clock.slot.saturating_sub(loan.last_accrual_slot);
-    loan.debt_accrued = accrue_interest(
-        loan.debt_principal,
-        loan.debt_accrued,
-        pool.interest_rate_bps_per_year,
-        slots_elapsed,
-    )?;
-    loan.last_accrual_slot = clock.slot;
-    let total_owed = loan
-        .debt_principal
-        .checked_add(loan.debt_accrued)
-        .ok_or(LiquidityError::MathOverflow)?;
+    // ---- Bump indexes; compute owed via index ratio ----
+    let real_a_pre = read_token_amount(vault_a_info)?;
+    let real_b_pre = read_token_amount(vault_b_info)?;
+    pool.bump_indexes(real_a_pre, real_b_pre, clock.slot)?;
+    let cur_index = pool.borrow_index_for_debt_side(loan.sides)?;
+    let total_owed = loan.owed(cur_index)?;
+    loan.last_touch_slot = clock.slot;
     let total_owed_u64: u64 = total_owed
         .try_into()
         .map_err(|_| LiquidityError::MathOverflow)?;
@@ -351,9 +345,8 @@ pub fn process_repay_loan(
     }
 
     msg!(
-        "RepayLoan principal={} accrued={} total={} band_now_empty={}",
+        "RepayLoan principal={} owed={} band_now_empty={}",
         loan.debt_principal,
-        loan.debt_accrued,
         total_owed_u64,
         band_now_empty
     );

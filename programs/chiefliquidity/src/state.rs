@@ -83,12 +83,26 @@ pub struct Pool {
     pub protocol_fee_bps: u16,
     pub _curve_pad: [u8; 3],
 
-    // Lending config
+    // Lending config (collateral health)
     pub liq_ratio_bps: u16,
     pub liq_penalty_bps: u16,
     pub max_ltv_bps: u16,
-    pub interest_rate_bps_per_year: u16,
-    pub _lending_pad: [u8; 8],
+    pub _lending_pad: [u8; 2],
+
+    // Interest model — shared rate curve, applied independently to each
+    // side's utilization (see DESIGN.md §8). Per-side state below.
+    pub interest_base_bps_per_year: u16,
+    pub interest_slope1_bps_per_year: u16,
+    pub interest_slope2_bps_per_year: u16,
+    pub interest_kink_bps: u16,
+
+    /// Monotonic borrow index for side A's debt (WAD-scaled, ≥ WAD).
+    /// owed_a = principal * borrow_index_a_wad / loan.borrow_index_snapshot_wad
+    pub borrow_index_a_wad: u128,
+    /// Same for side B.
+    pub borrow_index_b_wad: u128,
+    /// Slot at which both indexes were last bumped.
+    pub last_index_update_slot: u64,
 
     // Loan-ordering index heads (DESIGN.md §6)
     pub head_fall: Pubkey,
@@ -123,7 +137,9 @@ impl Pool {
         + 4                                   // 4× bump
         + 16 * 4                              // 4× u128 debt/collateral totals
         + 1 + 2 + 2 + 3                       // curve_kind, swap_fee_bps, protocol_fee_bps, _curve_pad
-        + 2 * 4 + 8                           // 4× u16 lending bps + _lending_pad
+        + 2 * 3 + 2                           // 3× u16 lending bps + _lending_pad (was 4× + 8 pad)
+        + 2 * 4                               // 4× u16 interest model params
+        + 16 * 2 + 8                          // borrow_index_a/b_wad + last_index_update_slot
         + 32 * 2 + 4 * 2                      // head_fall, head_rise, band_count_fall, band_count_rise
         + 8 * 3                               // open_loans, next_loan_nonce, last_update_slot
         + 8 * 2                               // protocol_fees_a, protocol_fees_b
@@ -222,6 +238,69 @@ impl Pool {
             _ => Err(LiquidityError::InvalidSidesEncoding),
         }
     }
+
+    /// Bump both per-side borrow indexes to `current_slot` using the rate
+    /// curve evaluated at the current per-side utilization. Idempotent
+    /// when `current_slot == last_index_update_slot`.
+    ///
+    /// MUST be called at the start of every instruction that reads or
+    /// writes `total_debt_x` or that reads a per-loan owed amount; the
+    /// indexes carry the LP's claim on accrued (but unrealized) interest.
+    pub fn bump_indexes(
+        &mut self,
+        real_a: u128,
+        real_b: u128,
+        current_slot: u64,
+    ) -> Result<(), LiquidityError> {
+        let slots_elapsed = current_slot.saturating_sub(self.last_index_update_slot);
+        if slots_elapsed == 0 {
+            return Ok(());
+        }
+        let (acc_a, acc_b) = self.accounted(real_a, real_b)?;
+
+        let util_a = crate::math::utilization_wad(self.total_debt_a, acc_a);
+        let util_b = crate::math::utilization_wad(self.total_debt_b, acc_b);
+
+        let rate_a = crate::math::compute_borrow_rate_wad_per_year(
+            util_a,
+            self.interest_base_bps_per_year,
+            self.interest_slope1_bps_per_year,
+            self.interest_slope2_bps_per_year,
+            self.interest_kink_bps,
+        )?;
+        let rate_b = crate::math::compute_borrow_rate_wad_per_year(
+            util_b,
+            self.interest_base_bps_per_year,
+            self.interest_slope1_bps_per_year,
+            self.interest_slope2_bps_per_year,
+            self.interest_kink_bps,
+        )?;
+
+        self.borrow_index_a_wad = crate::math::bump_index_wad(
+            self.borrow_index_a_wad,
+            rate_a,
+            slots_elapsed,
+        )?;
+        self.borrow_index_b_wad = crate::math::bump_index_wad(
+            self.borrow_index_b_wad,
+            rate_b,
+            slots_elapsed,
+        )?;
+        self.last_index_update_slot = current_slot;
+        Ok(())
+    }
+
+    /// Borrow index for the side that a `LoanSides`-encoded loan owes.
+    ///
+    /// CollateralA → debt is B → use borrow_index_b_wad.
+    /// CollateralB → debt is A → use borrow_index_a_wad.
+    pub fn borrow_index_for_debt_side(&self, sides_byte: u8) -> Result<u128, LiquidityError> {
+        match sides_byte {
+            0 => Ok(self.borrow_index_b_wad),
+            1 => Ok(self.borrow_index_a_wad),
+            _ => Err(LiquidityError::InvalidSidesEncoding),
+        }
+    }
 }
 
 // ===== Band-presence bitmap helpers =====
@@ -290,8 +369,11 @@ pub struct Loan {
 
     pub collateral_amount: u128,
     pub debt_principal: u128,
-    pub debt_accrued: u128,
-    pub last_accrual_slot: u64,
+    /// Pool's borrow index for this loan's debt side at the moment of open
+    /// (or last touch). Owed = `principal * pool.current_index / snapshot`.
+    pub borrow_index_snapshot_wad: u128,
+    /// Slot at which this loan last had its accrual realized (informational).
+    pub last_touch_slot: u64,
 
     /// B-per-A trigger price, WAD-scaled.
     pub trigger_price_wad: u128,
@@ -314,8 +396,8 @@ impl Loan {
         + 8                                   // nonce
         + 1                                   // bump
         + 1                                   // sides
-        + 16 * 3                              // collateral, principal, accrued
-        + 8                                   // last_accrual_slot
+        + 16 * 3                              // collateral, principal, borrow_index_snapshot
+        + 8                                   // last_touch_slot
         + 16                                  // trigger_price_wad
         + 1                                   // trigger_direction
         + 1 + 6                               // status + _status_pad
@@ -332,6 +414,16 @@ impl Loan {
 
     pub fn is_open(&self) -> bool {
         self.status == Self::STATUS_OPEN
+    }
+
+    /// Compute current owed (principal + interest) given the pool's
+    /// current borrow index for this loan's debt side.
+    pub fn owed(&self, pool_current_index_wad: u128) -> Result<u128, LiquidityError> {
+        crate::math::owed_from_index(
+            self.debt_principal,
+            self.borrow_index_snapshot_wad,
+            pool_current_index_wad,
+        )
     }
 
     pub fn derive_pda(
@@ -488,8 +580,14 @@ mod tests {
             liq_ratio_bps: 11000,
             liq_penalty_bps: 500,
             max_ltv_bps: 8000,
-            interest_rate_bps_per_year: 500,
-            _lending_pad: [0; 8],
+            _lending_pad: [0; 2],
+            interest_base_bps_per_year: 0,
+            interest_slope1_bps_per_year: 400,
+            interest_slope2_bps_per_year: 30_000,
+            interest_kink_bps: 8000,
+            borrow_index_a_wad: crate::math::WAD,
+            borrow_index_b_wad: crate::math::WAD,
+            last_index_update_slot: 0,
             head_fall: Pubkey::default(),
             head_rise: Pubkey::default(),
             band_count_fall: 0,
@@ -515,8 +613,8 @@ mod tests {
             sides: 0,
             collateral_amount: 50,
             debt_principal: 100,
-            debt_accrued: 0,
-            last_accrual_slot: 0,
+            borrow_index_snapshot_wad: crate::math::WAD,
+            last_touch_slot: 0,
             trigger_price_wad: 2_200_000_000_000_000_000,
             trigger_direction: 0,
             status: Loan::STATUS_OPEN,
@@ -759,12 +857,11 @@ mod tests {
         assert_eq!((acc_a, acc_b), (975, 4900 + 500));
     }
 
-    /// Confirm the corrected LEN constants, since DESIGN.md had arithmetic errors.
-    /// (DESIGN.md had Pool=442 and Loan=224; correct values verified by the
-    /// `*_size` borsh roundtrip tests above are 468 and 210.)
+    /// Confirm the LEN constants. Sizes drift as fields are added; tests
+    /// guard against accidental layout breakage.
     #[test]
     fn known_sizes() {
-        assert_eq!(Pool::LEN, 468);
+        assert_eq!(Pool::LEN, 508);
         assert_eq!(Loan::LEN, 210);
         assert_eq!(LoanLink::LEN, 176);
         assert_eq!(LoanIndexBand::LEN, 184);

@@ -94,6 +94,13 @@ pub fn process_open_loan(
 
     let sides = LoanSides::from_u8(sides_byte)?;
 
+    // Bump per-side borrow indexes BEFORE reading anything that depends on
+    // utilization (so the new loan's snapshot is the freshly-bumped value).
+    let clock_for_bump = Clock::get()?;
+    let pre_real_a = read_token_amount(vault_a_info)?;
+    let pre_real_b = read_token_amount(vault_b_info)?;
+    pool.bump_indexes(pre_real_a, pre_real_b, clock_for_bump.slot)?;
+
     // ---- Compute trigger price + LTV ----
     let (trigger_price_wad, direction) = recompute_trigger(
         sides,
@@ -319,6 +326,9 @@ pub fn process_open_loan(
     }
 
     // ---- Persist Loan ----
+    // Snapshot the borrow index for this loan's debt side as of right now
+    // (after the bump above). Owed = principal initially.
+    let borrow_index_snapshot_wad = pool.borrow_index_for_debt_side(sides_byte)?;
     let loan = Loan {
         discriminator: LOAN_DISCRIMINATOR,
         pool: *pool_info.key,
@@ -328,8 +338,8 @@ pub fn process_open_loan(
         sides: sides_byte,
         collateral_amount: collateral_amount as u128,
         debt_principal: debt_amount as u128,
-        debt_accrued: 0,
-        last_accrual_slot: clock.slot,
+        borrow_index_snapshot_wad,
+        last_touch_slot: clock.slot,
         trigger_price_wad,
         trigger_direction: direction_byte,
         status: Loan::STATUS_OPEN,
