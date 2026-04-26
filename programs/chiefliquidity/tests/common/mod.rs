@@ -11,7 +11,7 @@
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use chiefliquidity::{
-    state::{Loan, LoanIndexBand, LoanLink, Pool},
+    state::{bitmap_is_set, Loan, LoanIndexBand, LoanLink, Pool},
     LiquidityInstruction,
 };
 use solana_program::{
@@ -579,6 +579,103 @@ impl TestEnv {
             data: borsh::to_vec(&data).unwrap(),
         };
         self.send_with_new_blockhash(&[ix], &[borrower]).await
+    }
+
+    // ---- Swap helpers ----
+
+    /// Build and submit a Swap instruction with explicit per-band context.
+    /// `bands` is `[(band_id, [(link_pda, loan_pda), ...]), ...]` in
+    /// chain order (band.head_link forward via .next pointers).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn swap(
+        &mut self,
+        user: &Keypair,
+        ata_a: &Pubkey,
+        ata_b: &Pubkey,
+        amount_in: u64,
+        min_out: u64,
+        a_to_b: bool,
+        band_boundary: u32,
+        bands: &[(u32, Vec<(Pubkey, Pubkey)>)],
+    ) -> Result<(), TransportError> {
+        let mut accounts = vec![
+            AccountMeta::new(self.pool_pda().0, false),
+            AccountMeta::new(self.vault_a_pda().0, false),
+            AccountMeta::new(self.vault_b_pda().0, false),
+            AccountMeta::new(*ata_a, false),
+            AccountMeta::new(*ata_b, false),
+            AccountMeta::new_readonly(self.mint_a.pubkey(), false),
+            AccountMeta::new_readonly(self.mint_b.pubkey(), false),
+            AccountMeta::new_readonly(user.pubkey(), true),
+            AccountMeta::new_readonly(self.token_program, false),
+        ];
+        let direction: u8 = if a_to_b { 0 } else { 1 };
+        let mut band_link_counts = Vec::with_capacity(bands.len());
+        for (band_id, chain) in bands {
+            band_link_counts.push(chain.len() as u8);
+            let (band_pda, _) = self.band_pda(direction, *band_id);
+            accounts.push(AccountMeta::new(band_pda, false));
+            for (link, _) in chain {
+                accounts.push(AccountMeta::new(*link, false));
+            }
+            for (_, loan) in chain {
+                accounts.push(AccountMeta::new(*loan, false));
+            }
+        }
+        let data = LiquidityInstruction::Swap {
+            amount_in,
+            min_out,
+            a_to_b,
+            band_boundary,
+            band_link_counts,
+        };
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts,
+            data: borsh::to_vec(&data).unwrap(),
+        };
+        self.send_with_new_blockhash(&[ix], &[user]).await
+    }
+
+    /// Convenience: enumerate every populated band in the swap-relevant
+    /// direction (entire bitmap) and walk each band's chain. Yields the
+    /// `bands` argument for `swap` along with a wide-open boundary that
+    /// covers any cascade. Use this for happy-path tests that don't care
+    /// about minimizing the supplied account list.
+    pub async fn swap_full(
+        &mut self,
+        user: &Keypair,
+        ata_a: &Pubkey,
+        ata_b: &Pubkey,
+        amount_in: u64,
+        min_out: u64,
+        a_to_b: bool,
+    ) -> Result<(), TransportError> {
+        let pool = self.pool_state().await;
+        let direction: u8 = if a_to_b { 0 } else { 1 };
+        let bitmap = if a_to_b {
+            pool.band_bitmap_fall
+        } else {
+            pool.band_bitmap_rise
+        };
+        let boundary: u32 = if a_to_b { 0 } else { 127 };
+        let mut bands = Vec::new();
+        for band_id in 0u32..=127 {
+            if !bitmap_is_set(&bitmap, band_id) {
+                continue;
+            }
+            let band = self.band_state(direction, band_id).await.unwrap();
+            let mut chain = Vec::new();
+            let mut cur = band.head_link;
+            while cur != Pubkey::default() {
+                let link = self.loan_link_state(&cur).await.unwrap();
+                chain.push((cur, link.loan));
+                cur = link.next;
+            }
+            bands.push((band_id, chain));
+        }
+        self.swap(user, ata_a, ata_b, amount_in, min_out, a_to_b, boundary, &bands)
+            .await
     }
 
     /// Build + submit a ClaimLiquidatedRent instruction.
