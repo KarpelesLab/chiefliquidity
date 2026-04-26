@@ -47,6 +47,53 @@ pub enum LiquidityInstruction {
         max_ltv_bps: u16,
         interest_rate_bps_per_year: u16,
     },
+
+    /// Deposit `amount_a_max` of A and `amount_b_max` of B (or proportional
+    /// fraction thereof) and receive LP tokens.
+    ///
+    /// First deposit: takes both maxes verbatim and mints `sqrt(a*b)` LP.
+    /// Subsequent: takes the larger ratio-matched fraction and mints
+    /// `min(a/A, b/B) * lp_supply`.
+    ///
+    /// Accounts:
+    /// 0. `[writable]` Pool
+    /// 1. `[writable]` Vault A
+    /// 2. `[writable]` Vault B
+    /// 3. `[writable]` LP mint
+    /// 4. `[writable]` User token account A (source)
+    /// 5. `[writable]` User token account B (source)
+    /// 6. `[writable]` User LP token account (destination)
+    /// 7. `[signer]`   User
+    /// 8. `[]`         Mint A
+    /// 9. `[]`         Mint B
+    /// 10. `[]`        Token program
+    AddLiquidity {
+        amount_a_max: u64,
+        amount_b_max: u64,
+        min_lp_out: u64,
+    },
+
+    /// Burn `lp_amount` of LP and receive proportional shares of accounted
+    /// reserves. Reverts if real-reserve balances cannot cover the
+    /// withdrawal (e.g. pool is heavily lent out).
+    ///
+    /// Accounts:
+    /// 0. `[writable]` Pool
+    /// 1. `[writable]` Vault A
+    /// 2. `[writable]` Vault B
+    /// 3. `[writable]` LP mint
+    /// 4. `[writable]` User token account A (destination)
+    /// 5. `[writable]` User token account B (destination)
+    /// 6. `[writable]` User LP token account (source)
+    /// 7. `[signer]`   User
+    /// 8. `[]`         Mint A
+    /// 9. `[]`         Mint B
+    /// 10. `[]`        Token program
+    RemoveLiquidity {
+        lp_amount: u64,
+        min_a_out: u64,
+        min_b_out: u64,
+    },
 }
 
 #[cfg(not(feature = "no-entrypoint"))]
@@ -96,6 +143,34 @@ pub fn process_instruction(
                 liq_penalty_bps,
                 max_ltv_bps,
                 interest_rate_bps_per_year,
+            )
+        }
+        LiquidityInstruction::AddLiquidity {
+            amount_a_max,
+            amount_b_max,
+            min_lp_out,
+        } => {
+            msg!("Instruction: AddLiquidity");
+            process_add_liquidity(
+                program_id,
+                accounts,
+                amount_a_max,
+                amount_b_max,
+                min_lp_out,
+            )
+        }
+        LiquidityInstruction::RemoveLiquidity {
+            lp_amount,
+            min_a_out,
+            min_b_out,
+        } => {
+            msg!("Instruction: RemoveLiquidity");
+            process_remove_liquidity(
+                program_id,
+                accounts,
+                lp_amount,
+                min_a_out,
+                min_b_out,
             )
         }
     }

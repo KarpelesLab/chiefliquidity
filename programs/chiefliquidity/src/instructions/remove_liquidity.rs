@@ -1,0 +1,220 @@
+//! Burn LP tokens and withdraw proportional shares of accounted reserves.
+
+use borsh::{BorshDeserialize, BorshSerialize};
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    clock::Clock,
+    entrypoint::ProgramResult,
+    msg,
+    program::{invoke, invoke_signed},
+    pubkey::Pubkey,
+    sysvar::Sysvar,
+};
+use spl_token_2022::{
+    extension::StateWithExtensions,
+    state::{Account as TokenAccount, Mint},
+};
+
+use crate::{
+    error::LiquidityError,
+    math::mul_div,
+    state::{is_valid_token_program, Pool, POOL_SEED},
+};
+
+pub fn process_remove_liquidity(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    lp_amount: u64,
+    min_a_out: u64,
+    min_b_out: u64,
+) -> ProgramResult {
+    let it = &mut accounts.iter();
+
+    let pool_info = next_account_info(it)?;
+    let vault_a_info = next_account_info(it)?;
+    let vault_b_info = next_account_info(it)?;
+    let lp_mint_info = next_account_info(it)?;
+    let user_a_info = next_account_info(it)?;
+    let user_b_info = next_account_info(it)?;
+    let user_lp_info = next_account_info(it)?;
+    let user_info = next_account_info(it)?;
+    let mint_a_info = next_account_info(it)?;
+    let mint_b_info = next_account_info(it)?;
+    let token_program_info = next_account_info(it)?;
+
+    if !user_info.is_signer {
+        return Err(LiquidityError::MissingRequiredSigner.into());
+    }
+    if !is_valid_token_program(token_program_info.key) {
+        return Err(LiquidityError::InvalidTokenProgram.into());
+    }
+    if pool_info.owner != program_id {
+        return Err(LiquidityError::InvalidAccountOwner.into());
+    }
+    if lp_amount == 0 {
+        return Err(LiquidityError::ZeroAmount.into());
+    }
+
+    let mut pool = {
+        let data = pool_info.try_borrow_data()?;
+        Pool::try_from_slice(&data).map_err(|_| LiquidityError::AccountDataTooSmall)?
+    };
+    if !pool.is_initialized() {
+        return Err(LiquidityError::NotInitialized.into());
+    }
+    if pool.vault_a != *vault_a_info.key
+        || pool.vault_b != *vault_b_info.key
+        || pool.lp_mint != *lp_mint_info.key
+        || pool.mint_a != *mint_a_info.key
+        || pool.mint_b != *mint_b_info.key
+    {
+        return Err(LiquidityError::InvalidPool.into());
+    }
+
+    let mint_a_decimals = read_mint_decimals(mint_a_info)?;
+    let mint_b_decimals = read_mint_decimals(mint_b_info)?;
+    let lp_decimals = read_mint_decimals(lp_mint_info)?;
+    let lp_supply = read_mint_supply(lp_mint_info)?;
+    let real_a = read_token_amount(vault_a_info)?;
+    let real_b = read_token_amount(vault_b_info)?;
+
+    if lp_supply == 0 {
+        return Err(LiquidityError::ZeroReserves.into());
+    }
+    if (lp_amount as u128) > lp_supply {
+        return Err(LiquidityError::MathUnderflow.into());
+    }
+
+    let accounted_a = real_a
+        .checked_add(pool.total_debt_a)
+        .ok_or(LiquidityError::MathOverflow)?;
+    let accounted_b = real_b
+        .checked_add(pool.total_debt_b)
+        .ok_or(LiquidityError::MathOverflow)?;
+
+    let amount_a_out = mul_div(lp_amount as u128, accounted_a, lp_supply)?;
+    let amount_b_out = mul_div(lp_amount as u128, accounted_b, lp_supply)?;
+
+    let amount_a_out_u64: u64 = amount_a_out
+        .try_into()
+        .map_err(|_| LiquidityError::MathOverflow)?;
+    let amount_b_out_u64: u64 = amount_b_out
+        .try_into()
+        .map_err(|_| LiquidityError::MathOverflow)?;
+
+    if amount_a_out_u64 < min_a_out || amount_b_out_u64 < min_b_out {
+        return Err(LiquidityError::SlippageExceeded.into());
+    }
+
+    // Real-reserve coverage check: pool may be heavily lent out and unable to
+    // satisfy the proportional accounted withdrawal. Revert and let the user
+    // wait for repayments / liquidations.
+    if (amount_a_out_u64 as u128) > real_a || (amount_b_out_u64 as u128) > real_b {
+        return Err(LiquidityError::InsufficientExecutableLiquidity.into());
+    }
+
+    // ---- Burn LP from user ----
+    invoke(
+        &spl_token_2022::instruction::burn_checked(
+            token_program_info.key,
+            user_lp_info.key,
+            lp_mint_info.key,
+            user_info.key,
+            &[],
+            lp_amount,
+            lp_decimals,
+        )?,
+        &[
+            user_lp_info.clone(),
+            lp_mint_info.clone(),
+            user_info.clone(),
+        ],
+    )?;
+
+    // ---- Transfer A from vault → user (pool PDA signs) ----
+    let pool_seeds: &[&[u8]] = &[
+        POOL_SEED,
+        pool.mint_a.as_ref(),
+        pool.mint_b.as_ref(),
+        std::slice::from_ref(&pool.pool_bump),
+    ];
+    invoke_signed(
+        &spl_token_2022::instruction::transfer_checked(
+            token_program_info.key,
+            vault_a_info.key,
+            mint_a_info.key,
+            user_a_info.key,
+            pool_info.key,
+            &[],
+            amount_a_out_u64,
+            mint_a_decimals,
+        )?,
+        &[
+            vault_a_info.clone(),
+            mint_a_info.clone(),
+            user_a_info.clone(),
+            pool_info.clone(),
+        ],
+        &[pool_seeds],
+    )?;
+
+    // ---- Transfer B from vault → user ----
+    invoke_signed(
+        &spl_token_2022::instruction::transfer_checked(
+            token_program_info.key,
+            vault_b_info.key,
+            mint_b_info.key,
+            user_b_info.key,
+            pool_info.key,
+            &[],
+            amount_b_out_u64,
+            mint_b_decimals,
+        )?,
+        &[
+            vault_b_info.clone(),
+            mint_b_info.clone(),
+            user_b_info.clone(),
+            pool_info.clone(),
+        ],
+        &[pool_seeds],
+    )?;
+
+    pool.last_update_slot = Clock::get()?.slot;
+    let mut data = pool_info.try_borrow_mut_data()?;
+    pool.serialize(&mut &mut data[..])?;
+
+    msg!(
+        "RemoveLiquidity lp_in={} a_out={} b_out={}",
+        lp_amount,
+        amount_a_out_u64,
+        amount_b_out_u64
+    );
+    Ok(())
+}
+
+fn read_mint_decimals(info: &AccountInfo) -> Result<u8, LiquidityError> {
+    let data = info
+        .try_borrow_data()
+        .map_err(|_| LiquidityError::AccountDataTooSmall)?;
+    let state = StateWithExtensions::<Mint>::unpack(&data)
+        .map_err(|_| LiquidityError::InvalidPoolMint)?;
+    Ok(state.base.decimals)
+}
+
+fn read_mint_supply(info: &AccountInfo) -> Result<u128, LiquidityError> {
+    let data = info
+        .try_borrow_data()
+        .map_err(|_| LiquidityError::AccountDataTooSmall)?;
+    let state = StateWithExtensions::<Mint>::unpack(&data)
+        .map_err(|_| LiquidityError::InvalidPoolMint)?;
+    Ok(state.base.supply as u128)
+}
+
+fn read_token_amount(info: &AccountInfo) -> Result<u128, LiquidityError> {
+    let data = info
+        .try_borrow_data()
+        .map_err(|_| LiquidityError::AccountDataTooSmall)?;
+    let state = StateWithExtensions::<TokenAccount>::unpack(&data)
+        .map_err(|_| LiquidityError::InvalidVault)?;
+    Ok(state.base.amount as u128)
+}

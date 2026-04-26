@@ -52,6 +52,38 @@ pub fn wad_div(a: u128, b: u128) -> Result<u128, LiquidityError> {
     result.to_u128().ok_or(LiquidityError::MathOverflow)
 }
 
+// ===== Integer math helpers =====
+
+/// Integer square root by Newton's method. Returns floor(sqrt(n)).
+pub fn isqrt_u128(n: u128) -> u128 {
+    if n == 0 {
+        return 0;
+    }
+    // Initial estimate: 2^(ceil(log2(n)) / 2). Use a fast bit-length-based seed.
+    let bits = 128 - n.leading_zeros() as u128;
+    let mut x = 1u128 << ((bits + 1) / 2);
+    loop {
+        let y = (x + n / x) / 2;
+        if y >= x {
+            return x;
+        }
+        x = y;
+    }
+}
+
+/// Multiply-then-divide on u128 with U256 intermediate to avoid overflow.
+/// Returns floor(a * b / c).
+pub fn mul_div(a: u128, b: u128, c: u128) -> Result<u128, LiquidityError> {
+    if c == 0 {
+        return Err(LiquidityError::MathOverflow);
+    }
+    let prod = U256::from_u128(a)
+        .checked_mul(U256::from_u128(b))
+        .ok_or(LiquidityError::MathOverflow)?;
+    let q = prod / U256::from_u128(c);
+    q.to_u128().ok_or(LiquidityError::MathOverflow)
+}
+
 // ===== AMM quoting =====
 
 /// Constant-product AMM quote: how much of `out` token comes back when
@@ -380,6 +412,38 @@ mod tests {
             LoanSides::from_u8(2),
             Err(LiquidityError::InvalidSidesEncoding)
         );
+    }
+
+    #[test]
+    fn test_isqrt_basic() {
+        assert_eq!(isqrt_u128(0), 0);
+        assert_eq!(isqrt_u128(1), 1);
+        assert_eq!(isqrt_u128(2), 1);
+        assert_eq!(isqrt_u128(4), 2);
+        assert_eq!(isqrt_u128(9), 3);
+        assert_eq!(isqrt_u128(15), 3);
+        assert_eq!(isqrt_u128(16), 4);
+        assert_eq!(isqrt_u128(99), 9);
+        assert_eq!(isqrt_u128(100), 10);
+        assert_eq!(isqrt_u128(1_000_000), 1_000);
+        // Big number near u128 max
+        let big = u128::MAX;
+        let r = isqrt_u128(big);
+        // r^2 <= big < (r+1)^2 — second part may overflow, just check r^2 <= big
+        assert!(r as u128 <= u128::MAX / r as u128);
+    }
+
+    #[test]
+    fn test_mul_div() {
+        assert_eq!(mul_div(10, 20, 5).unwrap(), 40);
+        // Big enough to overflow u128 in the intermediate without U256
+        let r = mul_div(u128::MAX, 2, 4).unwrap();
+        assert_eq!(r, u128::MAX / 2);
+    }
+
+    #[test]
+    fn test_mul_div_zero_denom() {
+        assert_eq!(mul_div(10, 20, 0), Err(LiquidityError::MathOverflow));
     }
 
     #[test]
