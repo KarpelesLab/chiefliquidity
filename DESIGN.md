@@ -184,8 +184,9 @@ pub struct Pool {
 }
 ```
 
-`LEN` = 8 + 32×7 + 4 + 16×4 + 1 + 2 + 2 + 3 + 2×4 + 8 + 32×2 + 4×2 + 8×3 + 8×2 + 64
-= **442 bytes** (verify with a `borsh::to_vec(...).len()` test, like `chiefstaker::test_pool_size`).
+`LEN` = 8 + 32×6 + 4 + 16×4 + (1 + 2 + 2 + 3) + (2×4 + 8) + (32×2 + 4×2) + 8×3 + 8×2 + 64
+= 8 + 192 + 4 + 64 + 8 + 16 + 72 + 24 + 16 + 64 = **468 bytes** (verified by
+`state::tests::pool_size` borsh roundtrip).
 
 Notes:
 - `authority` is renounceable by setting to `Pubkey::default()`, same convention as
@@ -235,8 +236,9 @@ pub struct Loan {
 }
 ```
 
-`LEN` = 8 + 32 + 32 + 8 + 1 + 1 + 16×4 + 8 + 16 + 1 + 1 + 6 + 8 + 8 + 32
-= **224 bytes**.
+`LEN` = 8 + 32×2 + 8 + 1 + 1 + 16×3 + 8 + 16 + 1 + (1 + 6) + 8×2 + 32
+= 8 + 64 + 8 + 1 + 1 + 48 + 8 + 16 + 1 + 7 + 16 + 32 = **210 bytes** (verified by
+`state::tests::loan_size`).
 
 The on-chain index lives in a **separate** `LoanLink` PDA so we can rewire the
 sorted list without touching the loan account (which carries the bump and is
