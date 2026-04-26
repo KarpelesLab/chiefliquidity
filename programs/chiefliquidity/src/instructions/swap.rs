@@ -32,11 +32,12 @@ use spl_token_2022::{
 use crate::{
     error::LiquidityError,
     math::{
-        cpmm_quote_out, is_liquidatable, price_b_per_a_wad, LoanSides, TriggerDirection,
-        BPS_DENOM,
+        band_id_for_trigger, cpmm_quote_out, is_liquidatable, price_b_per_a_wad, LoanSides,
+        TriggerDirection, BPS_DENOM,
     },
     state::{
-        is_valid_token_program, Loan, LoanIndexBand, LoanLink, Pool, POOL_SEED,
+        bitmap_clear, bitmap_iter_set_range, is_valid_token_program, Loan, LoanIndexBand,
+        LoanLink, Pool, POOL_SEED,
     },
 };
 
@@ -73,12 +74,14 @@ struct BandCtx {
     link_idxs: Vec<usize>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn process_swap(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     amount_in: u64,
     min_out: u64,
     a_to_b: bool,
+    band_boundary: u32,
     band_link_counts: Vec<u8>,
 ) -> ProgramResult {
     if accounts.len() < FIXED_PREFIX_LEN {
@@ -125,6 +128,7 @@ pub fn process_swap(
     // ---- Parse the variable tail ----
     let mut bands: Vec<BandCtx> = Vec::with_capacity(band_link_counts.len());
     let mut loans: Vec<LoanCtx> = Vec::new();
+    let mut supplied_band_ids: Vec<u32> = Vec::with_capacity(band_link_counts.len());
     let mut cursor = FIXED_PREFIX_LEN;
     let expected_direction = if a_to_b {
         TriggerDirection::OnRise // A→B raises price → triggers OnRise (B-collateral) loans
@@ -232,11 +236,37 @@ pub fn process_swap(
                 return Err(LiquidityError::IncompleteBandWalk.into());
             }
         }
+        supplied_band_ids.push(band.band_id);
         bands.push(BandCtx { band_idx, link_idxs });
         cursor += needed;
     }
     if cursor != accounts.len() {
         return Err(LiquidityError::InvalidLiquidationContext.into());
+    }
+
+    // ---- Strict completeness check against pool bitmap ----
+    // Every set bit in the relevant bitmap, on the relevant side of
+    // `band_boundary`, must correspond to a supplied band. This catches
+    // callers omitting a populated band that could have triggered loans.
+    {
+        let bitmap = pool.band_bitmap(expected_dir_byte)?;
+        let (lo, hi) = if a_to_b {
+            // OnRise: relevant bands are those with band_id ≤ boundary.
+            (0u32, band_boundary)
+        } else {
+            // OnFall: relevant bands are those with band_id ≥ boundary.
+            (band_boundary, u32::MAX)
+        };
+        for required_id in bitmap_iter_set_range(bitmap, lo, hi) {
+            if !supplied_band_ids.contains(&required_id) {
+                msg!(
+                    "completeness: band_id={} (dir={}) is populated but not supplied",
+                    required_id,
+                    expected_dir_byte
+                );
+                return Err(LiquidityError::IncompleteBandWalk.into());
+            }
+        }
     }
 
     // ---- Initial reserve state ----
@@ -373,8 +403,39 @@ pub fn process_swap(
         return Err(LiquidityError::Insolvent.into());
     }
 
+    // ---- Final boundary check: post-swap price's band must be on the
+    // claimed side of `band_boundary`. If the cascade pushed the price past
+    // the caller's claim, more bands could have triggered. Revert. ----
+    let (final_post_a, final_post_b) = if a_to_b {
+        (
+            accounted_a + amount_in_after_fee_const,
+            accounted_b
+                .checked_sub(amount_out)
+                .ok_or(LiquidityError::MathUnderflow)?,
+        )
+    } else {
+        (
+            accounted_a
+                .checked_sub(amount_out)
+                .ok_or(LiquidityError::MathUnderflow)?,
+            accounted_b + amount_in_after_fee_const,
+        )
+    };
+    if final_post_a == 0 {
+        return Err(LiquidityError::ZeroReserves.into());
+    }
+    let final_post_price_wad = price_b_per_a_wad(final_post_a, final_post_b)?;
+    let final_post_band = band_id_for_trigger(final_post_price_wad)?;
+    if a_to_b {
+        if final_post_band > band_boundary {
+            return Err(LiquidityError::IncompleteBandWalk.into());
+        }
+    } else if final_post_band < band_boundary {
+        return Err(LiquidityError::IncompleteBandWalk.into());
+    }
+
     // ---- Persist liquidated loans + rewire band chains ----
-    persist_liquidations(accounts, &loans, &bands, program_id, pool_info.key)?;
+    persist_liquidations(accounts, &loans, &bands, &mut pool, expected_dir_byte)?;
 
     // ---- Token transfers ----
     let clock = Clock::get()?;
@@ -485,12 +546,17 @@ pub fn process_swap(
 /// Liquidated links are zeroed (data wiped); their lamports remain
 /// recoverable via a future cleanup instruction. Liquidated loans are
 /// marked `STATUS_LIQUIDATED` with their amounts zeroed.
+///
+/// If a band's link count drops to 0, its bit in the pool's bitmap is
+/// cleared so subsequent swaps don't have to supply it. The band PDA is
+/// left allocated (rent recoverable later) — the bitmap is the source of
+/// truth for "populated".
 fn persist_liquidations(
     accounts: &[AccountInfo],
     loans: &[LoanCtx],
     bands: &[BandCtx],
-    _program_id: &Pubkey,
-    _pool_key: &Pubkey,
+    pool: &mut Pool,
+    direction_byte: u8,
 ) -> ProgramResult {
     let clock = Clock::get()?;
 
@@ -576,10 +642,29 @@ fn persist_liquidations(
 
         band_state.head_link = new_head;
         band_state.tail_link = prev_pubkey;
+        let was_populated = band_state.count > 0;
         band_state.count = new_count;
         if new_count == 0 {
             band_state.min_trigger_wad = u128::MAX;
             band_state.max_trigger_wad = 0;
+            // Maintain bitmap invariant: bit set ↔ band has loans.
+            if was_populated {
+                bitmap_clear(pool.band_bitmap_mut(direction_byte)?, band_state.band_id)?;
+                match TriggerDirection::from_u8(direction_byte)? {
+                    TriggerDirection::OnFall => {
+                        pool.band_count_fall = pool
+                            .band_count_fall
+                            .checked_sub(1)
+                            .ok_or(LiquidityError::MathUnderflow)?;
+                    }
+                    TriggerDirection::OnRise => {
+                        pool.band_count_rise = pool
+                            .band_count_rise
+                            .checked_sub(1)
+                            .ok_or(LiquidityError::MathUnderflow)?;
+                    }
+                }
+            }
         } else {
             band_state.min_trigger_wad = new_min_trigger;
             band_state.max_trigger_wad = new_max_trigger;

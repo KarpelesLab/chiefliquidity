@@ -105,7 +105,15 @@ pub struct Pool {
     pub protocol_fees_a: u64,
     pub protocol_fees_b: u64,
 
-    pub _reserved: [u8; 64],
+    /// Bitmap of populated band ids in the OnFall direction. Bit `i` is set
+    /// iff a `LoanIndexBand` PDA exists for `(pool, OnFall, band_id=i)` with
+    /// `count > 0`. 16 bytes = 128 bits; band ids ≥ 128 are not representable
+    /// (well above any realistic price range, see DESIGN.md §6).
+    pub band_bitmap_fall: [u8; 16],
+    /// As above, OnRise direction.
+    pub band_bitmap_rise: [u8; 16],
+
+    pub _reserved: [u8; 32],
 }
 
 impl Pool {
@@ -119,7 +127,8 @@ impl Pool {
         + 32 * 2 + 4 * 2                      // head_fall, head_rise, band_count_fall, band_count_rise
         + 8 * 3                               // open_loans, next_loan_nonce, last_update_slot
         + 8 * 2                               // protocol_fees_a, protocol_fees_b
-        + 64;                                 // _reserved
+        + 16 * 2                              // band_bitmap_fall, band_bitmap_rise
+        + 32;                                 // _reserved
 
     pub fn is_initialized(&self) -> bool {
         self.discriminator == POOL_DISCRIMINATOR
@@ -190,6 +199,73 @@ impl Pool {
             .ok_or(LiquidityError::MathOverflow)?;
         Ok((a, b))
     }
+
+    /// Mutable reference to the bitmap for the given trigger direction.
+    pub fn band_bitmap_mut(&mut self, direction_byte: u8) -> Result<&mut [u8; 16], LiquidityError> {
+        match direction_byte {
+            0 => Ok(&mut self.band_bitmap_fall),
+            1 => Ok(&mut self.band_bitmap_rise),
+            _ => Err(LiquidityError::InvalidSidesEncoding),
+        }
+    }
+
+    /// Read-only reference to the bitmap for the given trigger direction.
+    pub fn band_bitmap(&self, direction_byte: u8) -> Result<&[u8; 16], LiquidityError> {
+        match direction_byte {
+            0 => Ok(&self.band_bitmap_fall),
+            1 => Ok(&self.band_bitmap_rise),
+            _ => Err(LiquidityError::InvalidSidesEncoding),
+        }
+    }
+}
+
+// ===== Band-presence bitmap helpers =====
+
+/// Maximum band id supported by the Pool's bitmap (16 bytes × 8 bits = 128).
+pub const MAX_BAND_ID: u32 = 127;
+
+/// Set bit `band_id` in the bitmap. Errors if `band_id > MAX_BAND_ID`.
+pub fn bitmap_set(bitmap: &mut [u8; 16], band_id: u32) -> Result<(), LiquidityError> {
+    if band_id > MAX_BAND_ID {
+        return Err(LiquidityError::SettingExceedsMaximum);
+    }
+    let byte = (band_id / 8) as usize;
+    let bit = (band_id % 8) as u8;
+    bitmap[byte] |= 1 << bit;
+    Ok(())
+}
+
+/// Clear bit `band_id`. No-op if the bit was already clear.
+pub fn bitmap_clear(bitmap: &mut [u8; 16], band_id: u32) -> Result<(), LiquidityError> {
+    if band_id > MAX_BAND_ID {
+        return Err(LiquidityError::SettingExceedsMaximum);
+    }
+    let byte = (band_id / 8) as usize;
+    let bit = (band_id % 8) as u8;
+    bitmap[byte] &= !(1 << bit);
+    Ok(())
+}
+
+/// Returns true if bit `band_id` is set. Returns false for out-of-range ids
+/// (since they cannot be in the bitmap).
+pub fn bitmap_is_set(bitmap: &[u8; 16], band_id: u32) -> bool {
+    if band_id > MAX_BAND_ID {
+        return false;
+    }
+    let byte = (band_id / 8) as usize;
+    let bit = (band_id % 8) as u8;
+    (bitmap[byte] & (1 << bit)) != 0
+}
+
+/// Iterate the set bits in `bitmap` whose ids fall in `[lo, hi]` inclusive.
+/// `hi` is clamped to `MAX_BAND_ID`. Closes the iterator when `lo > hi`.
+pub fn bitmap_iter_set_range(
+    bitmap: &[u8; 16],
+    lo: u32,
+    hi: u32,
+) -> impl Iterator<Item = u32> + '_ {
+    let hi = hi.min(MAX_BAND_ID);
+    (lo..=hi).filter(move |&id| bitmap_is_set(bitmap, id))
 }
 
 // ===== Loan =====
@@ -418,7 +494,9 @@ mod tests {
             last_update_slot: 0,
             protocol_fees_a: 0,
             protocol_fees_b: 0,
-            _reserved: [0; 64],
+            band_bitmap_fall: [0; 16],
+            band_bitmap_rise: [0; 16],
+            _reserved: [0; 32],
         }
     }
 
@@ -609,6 +687,48 @@ mod tests {
         p.total_debt_b = 0;
         let (a, b) = p.accounted(1050, 4900).unwrap();
         assert_eq!((a, b), (1050, 4900)); // LP gained 50 A, lost 100 B
+    }
+
+    #[test]
+    fn bitmap_set_clear_is_set() {
+        let mut bm = [0u8; 16];
+        assert!(!bitmap_is_set(&bm, 0));
+        bitmap_set(&mut bm, 0).unwrap();
+        assert!(bitmap_is_set(&bm, 0));
+        assert_eq!(bm[0], 0x01);
+
+        bitmap_set(&mut bm, 7).unwrap();
+        assert_eq!(bm[0], 0x81);
+        bitmap_set(&mut bm, 8).unwrap();
+        assert_eq!(bm[1], 0x01);
+
+        bitmap_clear(&mut bm, 7).unwrap();
+        assert_eq!(bm[0], 0x01);
+        assert!(!bitmap_is_set(&bm, 7));
+
+        // Boundary: highest valid id
+        bitmap_set(&mut bm, MAX_BAND_ID).unwrap();
+        assert!(bitmap_is_set(&bm, MAX_BAND_ID));
+        assert_eq!(bm[15], 0x80);
+
+        // Out of range
+        assert!(bitmap_set(&mut bm, MAX_BAND_ID + 1).is_err());
+        assert!(!bitmap_is_set(&bm, MAX_BAND_ID + 1));
+    }
+
+    #[test]
+    fn bitmap_iter_in_range() {
+        let mut bm = [0u8; 16];
+        bitmap_set(&mut bm, 5).unwrap();
+        bitmap_set(&mut bm, 64).unwrap();
+        bitmap_set(&mut bm, 65).unwrap();
+        bitmap_set(&mut bm, 100).unwrap();
+        let v: Vec<u32> = bitmap_iter_set_range(&bm, 60, 70).collect();
+        assert_eq!(v, vec![64, 65]);
+        let all: Vec<u32> = bitmap_iter_set_range(&bm, 0, 127).collect();
+        assert_eq!(all, vec![5, 64, 65, 100]);
+        let empty: Vec<u32> = bitmap_iter_set_range(&bm, 6, 60).collect();
+        assert!(empty.is_empty());
     }
 
     #[test]

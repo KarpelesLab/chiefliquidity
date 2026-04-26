@@ -29,9 +29,9 @@ use crate::{
         BPS_DENOM,
     },
     state::{
-        is_valid_token_program, Loan, LoanIndexBand, LoanLink, Pool, BAND_SEED,
-        LOAN_DISCRIMINATOR, LOAN_INDEX_BAND_DISCRIMINATOR, LOAN_LINK_DISCRIMINATOR,
-        LOAN_LINK_SEED, LOAN_SEED, POOL_SEED,
+        bitmap_set, is_valid_token_program, Loan, LoanIndexBand, LoanLink, Pool,
+        BAND_SEED, LOAN_DISCRIMINATOR, LOAN_INDEX_BAND_DISCRIMINATOR,
+        LOAN_LINK_DISCRIMINATOR, LOAN_LINK_SEED, LOAN_SEED, POOL_SEED,
     },
 };
 
@@ -261,7 +261,7 @@ pub fn process_open_loan(
         let mut data = band_info.try_borrow_mut_data()?;
         new_band.serialize(&mut &mut data[..])?;
         band_was_empty = true;
-        // Pool-level band counter
+        // Pool-level band counter + presence bitmap
         match direction {
             TriggerDirection::OnFall => {
                 pool.band_count_fall = pool
@@ -276,6 +276,7 @@ pub fn process_open_loan(
                     .ok_or(LiquidityError::MathOverflow)?
             }
         }
+        bitmap_set(pool.band_bitmap_mut(direction_byte)?, band_id)?;
     } else {
         band_was_empty = false;
     }

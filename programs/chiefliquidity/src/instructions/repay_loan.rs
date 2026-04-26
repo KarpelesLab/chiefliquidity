@@ -25,7 +25,10 @@ use spl_token_2022::{
 use crate::{
     error::LiquidityError,
     math::{accrue_interest, LoanSides, TriggerDirection},
-    state::{is_valid_token_program, Loan, LoanIndexBand, LoanLink, Pool, POOL_SEED},
+    state::{
+        bitmap_clear, is_valid_token_program, Loan, LoanIndexBand, LoanLink, Pool,
+        POOL_SEED,
+    },
 };
 
 pub fn process_repay_loan(
@@ -308,8 +311,9 @@ pub fn process_repay_loan(
         band.serialize(&mut &mut data[..])?;
     } else {
         // Band is empty — refund its rent to the borrower and zero its data.
-        // Pool-level band counter goes down too.
-        match TriggerDirection::from_u8(band.direction)? {
+        // Pool-level band counter and presence bitmap go down too.
+        let dir_byte = band.direction;
+        match TriggerDirection::from_u8(dir_byte)? {
             TriggerDirection::OnFall => {
                 pool.band_count_fall = pool
                     .band_count_fall
@@ -323,6 +327,7 @@ pub fn process_repay_loan(
                     .ok_or(LiquidityError::MathUnderflow)?;
             }
         }
+        bitmap_clear(pool.band_bitmap_mut(dir_byte)?, band.band_id)?;
         close_account(band_info, borrower_info)?;
     }
 

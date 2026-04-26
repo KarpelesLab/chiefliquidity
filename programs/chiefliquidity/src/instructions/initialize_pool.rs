@@ -253,7 +253,9 @@ pub fn process_initialize_pool(
         last_update_slot: clock.slot,
         protocol_fees_a: 0,
         protocol_fees_b: 0,
-        _reserved: [0; 64],
+        band_bitmap_fall: [0; 16],
+        band_bitmap_rise: [0; 16],
+        _reserved: [0; 32],
     };
     let mut data = pool_info.try_borrow_mut_data()?;
     pool.serialize(&mut &mut data[..])?;
