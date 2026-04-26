@@ -253,13 +253,13 @@ pub enum LiquidityInstruction {
         min_out: u64,
         a_to_b: bool,
         /// Band-completeness boundary, interpreted by direction:
-        /// - `a_to_b` (OnRise): caller asserts the post-swap price's band id
-        ///   is `≤ band_boundary`. Program verifies that **every** populated
-        ///   band with `band_id ≤ band_boundary` (per the pool's
-        ///   `band_bitmap_rise`) is included in the supplied tail.
-        /// - `!a_to_b` (OnFall): caller asserts the post-swap price's band id
-        ///   is `≥ band_boundary`. Program verifies the analogous condition
-        ///   against `band_bitmap_fall`.
+        /// - `a_to_b` (price falls → OnFall): caller asserts the post-swap
+        ///   price's band id is `≥ band_boundary`. Program verifies every
+        ///   populated band with `band_id ≥ band_boundary` (per the pool's
+        ///   `band_bitmap_fall`) is included in the supplied tail.
+        /// - `!a_to_b` (price rises → OnRise): caller asserts the post-swap
+        ///   price's band id is `≤ band_boundary`. Program verifies the
+        ///   analogous condition against `band_bitmap_rise`.
         band_boundary: u32,
         band_link_counts: Vec<u8>,
     },

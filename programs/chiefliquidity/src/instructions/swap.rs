@@ -130,10 +130,14 @@ pub fn process_swap(
     let mut loans: Vec<LoanCtx> = Vec::new();
     let mut supplied_band_ids: Vec<u32> = Vec::with_capacity(band_link_counts.len());
     let mut cursor = FIXED_PREFIX_LEN;
+    // a_to_b = user deposits A, withdraws B → vault A grows, vault B shrinks
+    //          → price_b_per_a = accounted_b / accounted_a FALLS
+    //          → CollateralA / OnFall loans become liquidatable.
+    // b_to_a is the mirror.
     let expected_direction = if a_to_b {
-        TriggerDirection::OnRise // A→B raises price → triggers OnRise (B-collateral) loans
-    } else {
         TriggerDirection::OnFall
+    } else {
+        TriggerDirection::OnRise
     };
     let expected_dir_byte = expected_direction as u8;
 
@@ -251,11 +255,14 @@ pub fn process_swap(
     {
         let bitmap = pool.band_bitmap(expected_dir_byte)?;
         let (lo, hi) = if a_to_b {
-            // OnRise: relevant bands are those with band_id ≤ boundary.
-            (0u32, band_boundary)
-        } else {
-            // OnFall: relevant bands are those with band_id ≥ boundary.
+            // OnFall: relevant bands have band_id ≥ band_id_for_trigger(post_price);
+            // caller asserts post-swap band ≥ band_boundary (i.e. we crossed
+            // DOWN from high band ids), so range to validate is
+            // [band_boundary, MAX].
             (band_boundary, u32::MAX)
+        } else {
+            // OnRise: post-swap band ≤ band_boundary, range is [0, band_boundary].
+            (0u32, band_boundary)
         };
         for required_id in bitmap_iter_set_range(bitmap, lo, hi) {
             if !supplied_band_ids.contains(&required_id) {
@@ -460,11 +467,13 @@ pub fn process_swap(
     }
     let final_post_price_wad = price_b_per_a_wad(final_post_a, final_post_b)?;
     let final_post_band = band_id_for_trigger(final_post_price_wad)?;
+    // For OnFall (a_to_b): final_post_band must be ≥ band_boundary (price
+    // didn't fall further than claimed). For OnRise (b_to_a): ≤ band_boundary.
     if a_to_b {
-        if final_post_band > band_boundary {
+        if final_post_band < band_boundary {
             return Err(LiquidityError::IncompleteBandWalk.into());
         }
-    } else if final_post_band < band_boundary {
+    } else if final_post_band > band_boundary {
         return Err(LiquidityError::IncompleteBandWalk.into());
     }
 
