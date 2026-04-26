@@ -1,0 +1,537 @@
+//! Open a collateralized loan against the pool.
+//!
+//! Creates a `Loan` and `LoanLink`; allocates the corresponding `LoanIndexBand`
+//! on first use; appends the new link to the tail of the band's intra-band
+//! chain. Updates `pool.total_debt_x`, `pool.total_collateral_y`,
+//! `pool.open_loans`, `pool.next_loan_nonce`.
+
+use borsh::{BorshDeserialize, BorshSerialize};
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    clock::Clock,
+    entrypoint::ProgramResult,
+    msg,
+    program::{invoke, invoke_signed},
+    pubkey::Pubkey,
+    rent::Rent,
+    system_instruction,
+    sysvar::Sysvar,
+};
+use spl_token_2022::{
+    extension::StateWithExtensions,
+    state::{Account as TokenAccount, Mint},
+};
+
+use crate::{
+    error::LiquidityError,
+    math::{
+        band_id_for_trigger, mul_div, recompute_trigger, LoanSides, TriggerDirection,
+        BPS_DENOM,
+    },
+    state::{
+        is_valid_token_program, Loan, LoanIndexBand, LoanLink, Pool, BAND_SEED,
+        LOAN_DISCRIMINATOR, LOAN_INDEX_BAND_DISCRIMINATOR, LOAN_LINK_DISCRIMINATOR,
+        LOAN_LINK_SEED, LOAN_SEED, POOL_SEED,
+    },
+};
+
+#[allow(clippy::too_many_arguments)]
+pub fn process_open_loan(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    sides_byte: u8,
+    collateral_amount: u64,
+    debt_amount: u64,
+    nonce: u64,
+) -> ProgramResult {
+    let it = &mut accounts.iter();
+
+    let pool_info = next_account_info(it)?;
+    let vault_a_info = next_account_info(it)?;
+    let vault_b_info = next_account_info(it)?;
+    let user_a_info = next_account_info(it)?;
+    let user_b_info = next_account_info(it)?;
+    let mint_a_info = next_account_info(it)?;
+    let mint_b_info = next_account_info(it)?;
+    let borrower_info = next_account_info(it)?;
+    let loan_info = next_account_info(it)?;
+    let loan_link_info = next_account_info(it)?;
+    let band_info = next_account_info(it)?;
+    let old_tail_info = next_account_info(it)?;
+    let system_program_info = next_account_info(it)?;
+    let token_program_info = next_account_info(it)?;
+
+    if !borrower_info.is_signer {
+        return Err(LiquidityError::MissingRequiredSigner.into());
+    }
+    if !is_valid_token_program(token_program_info.key) {
+        return Err(LiquidityError::InvalidTokenProgram.into());
+    }
+    if pool_info.owner != program_id {
+        return Err(LiquidityError::InvalidAccountOwner.into());
+    }
+    if collateral_amount == 0 || debt_amount == 0 {
+        return Err(LiquidityError::ZeroAmount.into());
+    }
+
+    let mut pool = {
+        let data = pool_info.try_borrow_data()?;
+        Pool::try_from_slice(&data).map_err(|_| LiquidityError::AccountDataTooSmall)?
+    };
+    if !pool.is_initialized() {
+        return Err(LiquidityError::NotInitialized.into());
+    }
+    if pool.vault_a != *vault_a_info.key
+        || pool.vault_b != *vault_b_info.key
+        || pool.mint_a != *mint_a_info.key
+        || pool.mint_b != *mint_b_info.key
+    {
+        return Err(LiquidityError::InvalidPool.into());
+    }
+    if nonce != pool.next_loan_nonce {
+        return Err(LiquidityError::InvalidInstruction.into());
+    }
+
+    let sides = LoanSides::from_u8(sides_byte)?;
+
+    // ---- Compute trigger price + LTV ----
+    let (trigger_price_wad, direction) = recompute_trigger(
+        sides,
+        collateral_amount as u128,
+        debt_amount as u128,
+        pool.liq_ratio_bps,
+    )?;
+
+    let real_a = read_token_amount(vault_a_info)?;
+    let real_b = read_token_amount(vault_b_info)?;
+    let accounted_a = real_a
+        .checked_add(pool.total_debt_a)
+        .ok_or(LiquidityError::MathOverflow)?;
+    let accounted_b = real_b
+        .checked_add(pool.total_debt_b)
+        .ok_or(LiquidityError::MathOverflow)?;
+    if accounted_a == 0 || accounted_b == 0 {
+        return Err(LiquidityError::ZeroReserves.into());
+    }
+
+    // ltv = debt_value / collateral_value, both in the same token's units via
+    // the pool mid-price.
+    //   CollateralA, DebtB:   ltv = debt * accounted_a / (collateral * accounted_b)
+    //   CollateralB, DebtA:   ltv = debt * accounted_b / (collateral * accounted_a)
+    let ltv_bps = match sides {
+        LoanSides::CollateralA => mul_div(
+            (debt_amount as u128) * BPS_DENOM,
+            accounted_a,
+            (collateral_amount as u128) * accounted_b,
+        )?,
+        LoanSides::CollateralB => mul_div(
+            (debt_amount as u128) * BPS_DENOM,
+            accounted_b,
+            (collateral_amount as u128) * accounted_a,
+        )?,
+    };
+    if ltv_bps > pool.max_ltv_bps as u128 {
+        msg!("ltv_bps {} > max_ltv_bps {}", ltv_bps, pool.max_ltv_bps);
+        return Err(LiquidityError::LtvExceedsMax.into());
+    }
+
+    // Real-reserve coverage: must be able to actually pay out the debt.
+    let (debt_vault_real, collateral_vault) = match sides {
+        LoanSides::CollateralA => (real_b, vault_a_info), // debt B paid out from vault_b
+        LoanSides::CollateralB => (real_a, vault_b_info),
+    };
+    let _ = collateral_vault; // reserved for clarity; flow uses *_info names directly below
+    if (debt_amount as u128) > debt_vault_real {
+        return Err(LiquidityError::InsufficientExecutableLiquidity.into());
+    }
+
+    // ---- PDA derivations ----
+    let (expected_loan, loan_bump) =
+        Loan::derive_pda(pool_info.key, borrower_info.key, nonce, program_id);
+    if *loan_info.key != expected_loan {
+        return Err(LiquidityError::InvalidPDA.into());
+    }
+    let (expected_link, link_bump) =
+        LoanLink::derive_pda(pool_info.key, loan_info.key, program_id);
+    if *loan_link_info.key != expected_link {
+        return Err(LiquidityError::InvalidPDA.into());
+    }
+    let band_id = band_id_for_trigger(trigger_price_wad)?;
+    let direction_byte = direction as u8;
+    let (expected_band, band_bump) =
+        LoanIndexBand::derive_pda(pool_info.key, direction_byte, band_id, program_id);
+    if *band_info.key != expected_band {
+        return Err(LiquidityError::BandMismatch.into());
+    }
+    if !loan_info.data_is_empty() {
+        return Err(LiquidityError::AlreadyInitialized.into());
+    }
+    if !loan_link_info.data_is_empty() {
+        return Err(LiquidityError::AlreadyInitialized.into());
+    }
+
+    let rent = Rent::get()?;
+    let clock = Clock::get()?;
+
+    // ---- Allocate Loan ----
+    let nonce_le = nonce.to_le_bytes();
+    let loan_seeds: &[&[u8]] = &[
+        LOAN_SEED,
+        pool_info.key.as_ref(),
+        borrower_info.key.as_ref(),
+        &nonce_le,
+        std::slice::from_ref(&loan_bump),
+    ];
+    invoke_signed(
+        &system_instruction::create_account(
+            borrower_info.key,
+            loan_info.key,
+            rent.minimum_balance(Loan::LEN),
+            Loan::LEN as u64,
+            program_id,
+        ),
+        &[
+            borrower_info.clone(),
+            loan_info.clone(),
+            system_program_info.clone(),
+        ],
+        &[loan_seeds],
+    )?;
+
+    // ---- Allocate LoanLink ----
+    let link_seeds: &[&[u8]] = &[
+        LOAN_LINK_SEED,
+        pool_info.key.as_ref(),
+        loan_info.key.as_ref(),
+        std::slice::from_ref(&link_bump),
+    ];
+    invoke_signed(
+        &system_instruction::create_account(
+            borrower_info.key,
+            loan_link_info.key,
+            rent.minimum_balance(LoanLink::LEN),
+            LoanLink::LEN as u64,
+            program_id,
+        ),
+        &[
+            borrower_info.clone(),
+            loan_link_info.clone(),
+            system_program_info.clone(),
+        ],
+        &[link_seeds],
+    )?;
+
+    // ---- Allocate Band on first use ----
+    let band_id_le = band_id.to_le_bytes();
+    let band_seeds: &[&[u8]] = &[
+        BAND_SEED,
+        pool_info.key.as_ref(),
+        std::slice::from_ref(&direction_byte),
+        &band_id_le,
+        std::slice::from_ref(&band_bump),
+    ];
+    let band_was_empty;
+    if band_info.data_is_empty() {
+        invoke_signed(
+            &system_instruction::create_account(
+                borrower_info.key,
+                band_info.key,
+                rent.minimum_balance(LoanIndexBand::LEN),
+                LoanIndexBand::LEN as u64,
+                program_id,
+            ),
+            &[
+                borrower_info.clone(),
+                band_info.clone(),
+                system_program_info.clone(),
+            ],
+            &[band_seeds],
+        )?;
+        let new_band = LoanIndexBand {
+            discriminator: LOAN_INDEX_BAND_DISCRIMINATOR,
+            pool: *pool_info.key,
+            band_id,
+            direction: direction_byte,
+            bump: band_bump,
+            _pad: [0; 2],
+            head_link: Pubkey::default(),
+            tail_link: Pubkey::default(),
+            count: 0,
+            _pad2: [0; 4],
+            min_trigger_wad: u128::MAX,
+            max_trigger_wad: 0,
+            _reserved: [0; 32],
+        };
+        let mut data = band_info.try_borrow_mut_data()?;
+        new_band.serialize(&mut &mut data[..])?;
+        band_was_empty = true;
+        // Pool-level band counter
+        match direction {
+            TriggerDirection::OnFall => {
+                pool.band_count_fall = pool
+                    .band_count_fall
+                    .checked_add(1)
+                    .ok_or(LiquidityError::MathOverflow)?
+            }
+            TriggerDirection::OnRise => {
+                pool.band_count_rise = pool
+                    .band_count_rise
+                    .checked_add(1)
+                    .ok_or(LiquidityError::MathOverflow)?
+            }
+        }
+    } else {
+        band_was_empty = false;
+    }
+
+    // Load (and potentially update) band
+    let mut band = {
+        let data = band_info.try_borrow_data()?;
+        LoanIndexBand::try_from_slice(&data)
+            .map_err(|_| LiquidityError::AccountDataTooSmall)?
+    };
+    if !band.is_initialized()
+        || band.pool != *pool_info.key
+        || band.band_id != band_id
+        || band.direction != direction_byte
+    {
+        return Err(LiquidityError::BandMismatch.into());
+    }
+    if band.count >= LoanIndexBand::MAX_LINKS {
+        return Err(LiquidityError::BandFull.into());
+    }
+
+    // ---- Wire the new link into the band's tail ----
+    let prev_pubkey = band.tail_link;
+    if !band_was_empty {
+        if *old_tail_info.key != band.tail_link {
+            return Err(LiquidityError::LinkChainBroken.into());
+        }
+        // Update old tail's `next` to point at the new link.
+        let mut old_tail = {
+            let data = old_tail_info.try_borrow_data()?;
+            LoanLink::try_from_slice(&data)
+                .map_err(|_| LiquidityError::AccountDataTooSmall)?
+        };
+        if !old_tail.is_initialized() {
+            return Err(LiquidityError::NotInitialized.into());
+        }
+        old_tail.next = *loan_link_info.key;
+        let mut data = old_tail_info.try_borrow_mut_data()?;
+        old_tail.serialize(&mut &mut data[..])?;
+    }
+
+    // ---- Persist Loan ----
+    let loan = Loan {
+        discriminator: LOAN_DISCRIMINATOR,
+        pool: *pool_info.key,
+        borrower: *borrower_info.key,
+        nonce,
+        bump: loan_bump,
+        sides: sides_byte,
+        collateral_amount: collateral_amount as u128,
+        debt_principal: debt_amount as u128,
+        debt_accrued: 0,
+        last_accrual_slot: clock.slot,
+        trigger_price_wad,
+        trigger_direction: direction_byte,
+        status: Loan::STATUS_OPEN,
+        _status_pad: [0; 6],
+        opened_slot: clock.slot,
+        closed_slot: 0,
+        _reserved: [0; 32],
+    };
+    {
+        let mut data = loan_info.try_borrow_mut_data()?;
+        loan.serialize(&mut &mut data[..])?;
+    }
+
+    // ---- Persist LoanLink ----
+    let link = LoanLink {
+        discriminator: LOAN_LINK_DISCRIMINATOR,
+        pool: *pool_info.key,
+        loan: *loan_info.key,
+        band_id,
+        direction: direction_byte,
+        bump: link_bump,
+        _pad: [0; 2],
+        prev: prev_pubkey,
+        next: Pubkey::default(),
+        trigger_price_wad,
+        _reserved: [0; 16],
+    };
+    {
+        let mut data = loan_link_info.try_borrow_mut_data()?;
+        link.serialize(&mut &mut data[..])?;
+    }
+
+    // ---- Update Band ----
+    if band_was_empty {
+        band.head_link = *loan_link_info.key;
+    }
+    band.tail_link = *loan_link_info.key;
+    band.count = band
+        .count
+        .checked_add(1)
+        .ok_or(LiquidityError::MathOverflow)?;
+    if trigger_price_wad < band.min_trigger_wad {
+        band.min_trigger_wad = trigger_price_wad;
+    }
+    if trigger_price_wad > band.max_trigger_wad {
+        band.max_trigger_wad = trigger_price_wad;
+    }
+    {
+        let mut data = band_info.try_borrow_mut_data()?;
+        band.serialize(&mut &mut data[..])?;
+    }
+
+    // ---- Token transfers ----
+    let mint_a_decimals = read_mint_decimals(mint_a_info)?;
+    let mint_b_decimals = read_mint_decimals(mint_b_info)?;
+
+    let (
+        collateral_user_info,
+        collateral_vault_info,
+        collateral_mint_info,
+        collateral_decimals,
+        debt_user_info,
+        debt_vault_info,
+        debt_mint_info,
+        debt_decimals,
+    ) = match sides {
+        LoanSides::CollateralA => (
+            user_a_info,
+            vault_a_info,
+            mint_a_info,
+            mint_a_decimals,
+            user_b_info,
+            vault_b_info,
+            mint_b_info,
+            mint_b_decimals,
+        ),
+        LoanSides::CollateralB => (
+            user_b_info,
+            vault_b_info,
+            mint_b_info,
+            mint_b_decimals,
+            user_a_info,
+            vault_a_info,
+            mint_a_info,
+            mint_a_decimals,
+        ),
+    };
+
+    // Collateral: borrower → vault
+    invoke(
+        &spl_token_2022::instruction::transfer_checked(
+            token_program_info.key,
+            collateral_user_info.key,
+            collateral_mint_info.key,
+            collateral_vault_info.key,
+            borrower_info.key,
+            &[],
+            collateral_amount,
+            collateral_decimals,
+        )?,
+        &[
+            collateral_user_info.clone(),
+            collateral_mint_info.clone(),
+            collateral_vault_info.clone(),
+            borrower_info.clone(),
+        ],
+    )?;
+
+    // Debt: vault → borrower (pool PDA signs)
+    let pool_pda_seeds: &[&[u8]] = &[
+        POOL_SEED,
+        pool.mint_a.as_ref(),
+        pool.mint_b.as_ref(),
+        std::slice::from_ref(&pool.pool_bump),
+    ];
+    invoke_signed(
+        &spl_token_2022::instruction::transfer_checked(
+            token_program_info.key,
+            debt_vault_info.key,
+            debt_mint_info.key,
+            debt_user_info.key,
+            pool_info.key,
+            &[],
+            debt_amount,
+            debt_decimals,
+        )?,
+        &[
+            debt_vault_info.clone(),
+            debt_mint_info.clone(),
+            debt_user_info.clone(),
+            pool_info.clone(),
+        ],
+        &[pool_pda_seeds],
+    )?;
+
+    // ---- Update Pool ----
+    match sides {
+        LoanSides::CollateralA => {
+            pool.total_collateral_a = pool
+                .total_collateral_a
+                .checked_add(collateral_amount as u128)
+                .ok_or(LiquidityError::MathOverflow)?;
+            pool.total_debt_b = pool
+                .total_debt_b
+                .checked_add(debt_amount as u128)
+                .ok_or(LiquidityError::MathOverflow)?;
+        }
+        LoanSides::CollateralB => {
+            pool.total_collateral_b = pool
+                .total_collateral_b
+                .checked_add(collateral_amount as u128)
+                .ok_or(LiquidityError::MathOverflow)?;
+            pool.total_debt_a = pool
+                .total_debt_a
+                .checked_add(debt_amount as u128)
+                .ok_or(LiquidityError::MathOverflow)?;
+        }
+    }
+    pool.open_loans = pool
+        .open_loans
+        .checked_add(1)
+        .ok_or(LiquidityError::MathOverflow)?;
+    pool.next_loan_nonce = pool
+        .next_loan_nonce
+        .checked_add(1)
+        .ok_or(LiquidityError::MathOverflow)?;
+    pool.last_update_slot = clock.slot;
+    {
+        let mut data = pool_info.try_borrow_mut_data()?;
+        pool.serialize(&mut &mut data[..])?;
+    }
+
+    msg!(
+        "OpenLoan nonce={} sides={} coll={} debt={} band={} dir={} trigger_wad={}",
+        nonce,
+        sides_byte,
+        collateral_amount,
+        debt_amount,
+        band_id,
+        direction_byte,
+        trigger_price_wad
+    );
+    Ok(())
+}
+
+fn read_mint_decimals(info: &AccountInfo) -> Result<u8, LiquidityError> {
+    let data = info
+        .try_borrow_data()
+        .map_err(|_| LiquidityError::AccountDataTooSmall)?;
+    let state = StateWithExtensions::<Mint>::unpack(&data)
+        .map_err(|_| LiquidityError::InvalidPoolMint)?;
+    Ok(state.base.decimals)
+}
+
+fn read_token_amount(info: &AccountInfo) -> Result<u128, LiquidityError> {
+    let data = info
+        .try_borrow_data()
+        .map_err(|_| LiquidityError::AccountDataTooSmall)?;
+    let state = StateWithExtensions::<TokenAccount>::unpack(&data)
+        .map_err(|_| LiquidityError::InvalidVault)?;
+    Ok(state.base.amount as u128)
+}

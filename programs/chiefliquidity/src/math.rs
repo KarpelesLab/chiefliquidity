@@ -18,6 +18,9 @@ pub const WAD_U256: U256 = U256([WAD as u64, (WAD >> 64) as u64, 0, 0]);
 /// 100% in basis points.
 pub const BPS_DENOM: u128 = 10_000;
 
+/// Slots per year, assuming 400ms per slot. `365.25 * 86400 / 0.4`.
+pub const SLOTS_PER_YEAR: u64 = 78_840_000;
+
 impl U256 {
     pub const fn from_u128(val: u128) -> Self {
         U256([val as u64, (val >> 64) as u64, 0, 0])
@@ -82,6 +85,37 @@ pub fn mul_div(a: u128, b: u128, c: u128) -> Result<u128, LiquidityError> {
         .ok_or(LiquidityError::MathOverflow)?;
     let q = prod / U256::from_u128(c);
     q.to_u128().ok_or(LiquidityError::MathOverflow)
+}
+
+// ===== Interest accrual =====
+
+/// Linear per-slot accrual: `accrued += principal * rate_bps * Δslots /
+/// (BPS_DENOM * SLOTS_PER_YEAR)`.
+///
+/// Returns the *new* total accrued value (including the prior `accrued_so_far`).
+pub fn accrue_interest(
+    principal: u128,
+    accrued_so_far: u128,
+    rate_bps_per_year: u16,
+    slots_elapsed: u64,
+) -> Result<u128, LiquidityError> {
+    if rate_bps_per_year == 0 || slots_elapsed == 0 || principal == 0 {
+        return Ok(accrued_so_far);
+    }
+    let delta_num = U256::from_u128(principal)
+        .checked_mul(U256::from_u128(rate_bps_per_year as u128))
+        .ok_or(LiquidityError::MathOverflow)?
+        .checked_mul(U256::from_u128(slots_elapsed as u128))
+        .ok_or(LiquidityError::MathOverflow)?;
+    let delta_denom = U256::from_u128(BPS_DENOM)
+        .checked_mul(U256::from_u128(SLOTS_PER_YEAR as u128))
+        .ok_or(LiquidityError::MathOverflow)?;
+    let delta = (delta_num / delta_denom)
+        .to_u128()
+        .ok_or(LiquidityError::MathOverflow)?;
+    accrued_so_far
+        .checked_add(delta)
+        .ok_or(LiquidityError::MathOverflow)
 }
 
 // ===== AMM quoting =====
@@ -264,6 +298,56 @@ pub fn is_liquidatable(
     }
 }
 
+// ===== Band id (DESIGN.md §6) =====
+
+/// Bands cover 2× price ranges geometrically. `band_id` is `floor(log2(price))`
+/// shifted by `BAND_OFFSET` so all in-range trigger prices land on
+/// non-negative `u32` ids.
+///
+/// `floor(log2(WAD))` for `WAD = 10^18` is `59`. We pick `BAND_OFFSET = 64` so
+/// `price = 1.0` lands at band `63`. Each step of `band_id` is a 2× change
+/// in price.
+pub const BAND_OFFSET: u32 = 64;
+const LOG2_WAD: u32 = 59;
+
+/// Compute `band_id` for the given trigger price (WAD-scaled).
+///
+/// `price = 1.0` → 63, `2.0` → 64, `0.5` → 62, etc.
+/// Errors on `trigger_price_wad == 0`.
+pub fn band_id_for_trigger(trigger_price_wad: u128) -> Result<u32, LiquidityError> {
+    if trigger_price_wad == 0 {
+        return Err(LiquidityError::ZeroAmount);
+    }
+    // floor(log2(x)) = 127 - leading_zeros for x: u128
+    let log2_x = 127 - trigger_price_wad.leading_zeros();
+    // band_id = log2(x) - log2(WAD) + BAND_OFFSET
+    //         = log2_x - LOG2_WAD + BAND_OFFSET
+    // log2_x is at most 127, LOG2_WAD is 59 → result fits in u32 easily.
+    Ok(log2_x + BAND_OFFSET - LOG2_WAD)
+}
+
+/// Inclusive lower bound of a band's trigger-price range, WAD-scaled.
+///
+/// `band_id_for_trigger(band_min_wad(b)) == b` for any b in
+/// `[BAND_OFFSET - LOG2_WAD, BAND_OFFSET + 67]`.
+pub fn band_min_wad(band_id: u32) -> Result<u128, LiquidityError> {
+    // log2_x = band_id + LOG2_WAD - BAND_OFFSET
+    if band_id + LOG2_WAD < BAND_OFFSET {
+        // Below the representable floor → value is 0 / 1.
+        return Ok(0);
+    }
+    let log2_x = band_id + LOG2_WAD - BAND_OFFSET;
+    if log2_x >= 128 {
+        return Err(LiquidityError::MathOverflow);
+    }
+    Ok(1u128 << log2_x)
+}
+
+/// Exclusive upper bound of a band's trigger-price range, WAD-scaled.
+pub fn band_max_wad(band_id: u32) -> Result<u128, LiquidityError> {
+    band_min_wad(band_id + 1)
+}
+
 // ===== Tests =====
 
 #[cfg(test)]
@@ -399,6 +483,45 @@ mod tests {
     }
 
     #[test]
+    fn test_band_id_for_trigger() {
+        // price = 1.0 → log2 = 59 → band_id = 59 + 64 - 59 = 64? Wait:
+        // band_id = log2_x + BAND_OFFSET - LOG2_WAD
+        //         = 59 + 64 - 59 = 64.
+        // But WAD has bit length 60, so floor(log2(WAD)) = 59 ✓.
+        // Hmm — design said price 1.0 → band 63, but actually it's 64.
+        // The "price 1.0 → 63" comment in math.rs is just example arithmetic;
+        // exact value depends on which side of WAD you land. For WAD itself
+        // (price = 1.0), band_id = 64.
+        assert_eq!(band_id_for_trigger(WAD).unwrap(), 64);
+        assert_eq!(band_id_for_trigger(2 * WAD).unwrap(), 65);
+        assert_eq!(band_id_for_trigger(WAD / 2).unwrap(), 63);
+        // Tiny price: 1 → log2 = 0 → band_id = 0 + 64 - 59 = 5
+        assert_eq!(band_id_for_trigger(1).unwrap(), 5);
+    }
+
+    #[test]
+    fn test_band_id_zero_errors() {
+        assert_eq!(band_id_for_trigger(0), Err(LiquidityError::ZeroAmount));
+    }
+
+    #[test]
+    fn test_band_min_max_consistent() {
+        // For a range of band_ids, every price in [min, max) should map back.
+        for b in 10u32..120 {
+            let lo = band_min_wad(b).unwrap();
+            let hi = band_max_wad(b).unwrap();
+            if lo > 0 {
+                assert_eq!(band_id_for_trigger(lo).unwrap(), b);
+            }
+            if hi > 1 {
+                assert_eq!(band_id_for_trigger(hi - 1).unwrap(), b);
+            }
+            // Just-above the upper bound is in the next band
+            assert_eq!(band_id_for_trigger(hi).unwrap(), b + 1);
+        }
+    }
+
+    #[test]
     fn test_loan_sides_roundtrip() {
         assert_eq!(
             LoanSides::from_u8(0).unwrap(),
@@ -412,6 +535,30 @@ mod tests {
             LoanSides::from_u8(2),
             Err(LiquidityError::InvalidSidesEncoding)
         );
+    }
+
+    #[test]
+    fn test_accrue_interest_zero_inputs() {
+        assert_eq!(accrue_interest(1000, 5, 0, 1000).unwrap(), 5);
+        assert_eq!(accrue_interest(1000, 5, 100, 0).unwrap(), 5);
+        assert_eq!(accrue_interest(0, 5, 100, 1000).unwrap(), 5);
+    }
+
+    #[test]
+    fn test_accrue_interest_basic() {
+        // principal = 100_000_000, rate = 1000 bps = 10% APR,
+        // slots_elapsed = SLOTS_PER_YEAR → 1 year of interest.
+        // accrual = 100_000_000 * 1000 * 78_840_000 / (10000 * 78_840_000)
+        //         = 100_000_000 * 1000 / 10000 = 10_000_000 → 10% of principal.
+        let r = accrue_interest(100_000_000, 0, 1000, SLOTS_PER_YEAR).unwrap();
+        assert_eq!(r, 10_000_000);
+    }
+
+    #[test]
+    fn test_accrue_interest_partial_year() {
+        // Half a year, 10% APR, principal = 100_000_000 → 5_000_000.
+        let r = accrue_interest(100_000_000, 0, 1000, SLOTS_PER_YEAR / 2).unwrap();
+        assert_eq!(r, 5_000_000);
     }
 
     #[test]

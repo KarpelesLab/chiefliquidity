@@ -94,6 +94,62 @@ pub enum LiquidityInstruction {
         min_a_out: u64,
         min_b_out: u64,
     },
+
+    /// Open a collateralized loan. Caller specifies the side (which token is
+    /// collateral, which is debt), the amounts, and the loan nonce (which
+    /// must equal `pool.next_loan_nonce`). Program computes the trigger
+    /// price and band id from the supplied amounts and `liq_ratio_bps`, and
+    /// inserts a new `LoanLink` at the tail of the band's intra-band chain.
+    ///
+    /// LTV check: debt_value / collateral_value ≤ `pool.max_ltv_bps`, with
+    /// values converted via the pool's accounted mid-price.
+    ///
+    /// Accounts:
+    /// 0. `[writable]` Pool
+    /// 1. `[writable]` Vault A
+    /// 2. `[writable]` Vault B
+    /// 3. `[writable]` Borrower's token account A
+    /// 4. `[writable]` Borrower's token account B
+    /// 5. `[]`         Mint A
+    /// 6. `[]`         Mint B
+    /// 7. `[writable, signer]` Borrower (also the rent payer for new accounts)
+    /// 8. `[writable]` Loan PDA — `["loan", pool, borrower, nonce_le]`
+    /// 9. `[writable]` LoanLink PDA — `["loan_link", pool, loan]`
+    /// 10. `[writable]` Band PDA — `["band", pool, direction, band_id_le]`
+    /// 11. `[writable]` Old tail link PDA (= band.tail). If band is empty,
+    ///                  pass the new LoanLink account as a placeholder.
+    /// 12. `[]`        System program
+    /// 13. `[]`        Token program
+    OpenLoan {
+        sides: u8,
+        collateral_amount: u64,
+        debt_amount: u64,
+        nonce: u64,
+    },
+
+    /// Repay a loan in full (no partial repay in v1). Transfers the
+    /// principal-plus-accrued debt back into the pool, releases the
+    /// collateral to the borrower, unlinks the `LoanLink` from its band,
+    /// and marks the `Loan` as repaid.
+    ///
+    /// Accounts:
+    /// 0. `[writable]` Pool
+    /// 1. `[writable]` Vault A
+    /// 2. `[writable]` Vault B
+    /// 3. `[writable]` Borrower's token account A
+    /// 4. `[writable]` Borrower's token account B
+    /// 5. `[]`         Mint A
+    /// 6. `[]`         Mint B
+    /// 7. `[writable, signer]` Borrower
+    /// 8. `[writable]` Loan
+    /// 9. `[writable]` LoanLink
+    /// 10. `[writable]` Band
+    /// 11. `[writable]` Prev link (= loan_link.prev). If loan is at head, pass
+    ///                  the loan_link itself as a placeholder.
+    /// 12. `[writable]` Next link (= loan_link.next). If loan is at tail, pass
+    ///                  the loan_link itself as a placeholder.
+    /// 13. `[]`        Token program
+    RepayLoan,
 }
 
 #[cfg(not(feature = "no-entrypoint"))]
@@ -172,6 +228,26 @@ pub fn process_instruction(
                 min_a_out,
                 min_b_out,
             )
+        }
+        LiquidityInstruction::OpenLoan {
+            sides,
+            collateral_amount,
+            debt_amount,
+            nonce,
+        } => {
+            msg!("Instruction: OpenLoan");
+            process_open_loan(
+                program_id,
+                accounts,
+                sides,
+                collateral_amount,
+                debt_amount,
+                nonce,
+            )
+        }
+        LiquidityInstruction::RepayLoan => {
+            msg!("Instruction: RepayLoan");
+            process_repay_loan(program_id, accounts)
         }
     }
 }
