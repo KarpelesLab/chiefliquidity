@@ -11,10 +11,12 @@ use chiefliquidity::{
 use common::{err_code, extract_custom_error, PoolParams, TestEnv};
 use solana_program::{
     instruction::{AccountMeta, Instruction},
-    program_pack::Pack,
 };
 use solana_sdk::signature::Signer;
-use spl_token_2022::state::{Account as TokenAccount, Mint};
+use spl_token_2022::{
+    extension::StateWithExtensions,
+    state::{Account as TokenAccount, Mint},
+};
 
 #[tokio::test]
 async fn happy_path_creates_all_pdas_and_persists_pool() {
@@ -56,7 +58,7 @@ async fn happy_path_creates_all_pdas_and_persists_pool() {
         .unwrap()
         .unwrap();
     assert_eq!(vault_a_acc.owner, env.token_program);
-    let vault_a_state = TokenAccount::unpack(&vault_a_acc.data).unwrap();
+    let vault_a_state = StateWithExtensions::<TokenAccount>::unpack(&vault_a_acc.data).unwrap().base;
     assert_eq!(vault_a_state.amount, 0);
     assert_eq!(vault_a_state.owner, env.pool_pda().0);
     assert_eq!(vault_a_state.mint, env.mint_a.pubkey());
@@ -68,7 +70,7 @@ async fn happy_path_creates_all_pdas_and_persists_pool() {
         .await
         .unwrap()
         .unwrap();
-    let lp_mint = Mint::unpack(&lp_acc.data).unwrap();
+    let lp_mint = StateWithExtensions::<Mint>::unpack(&lp_acc.data).unwrap().base;
     assert_eq!(lp_mint.supply, 0);
     let auth: Option<solana_program::pubkey::Pubkey> = lp_mint.mint_authority.into();
     assert_eq!(auth, Some(env.pool_pda().0));

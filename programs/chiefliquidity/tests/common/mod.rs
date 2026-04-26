@@ -31,7 +31,10 @@ use solana_sdk::{
 use spl_associated_token_account::{
     get_associated_token_address_with_program_id, instruction::create_associated_token_account,
 };
-use spl_token_2022::{instruction as token_ix, state::Mint};
+use spl_token_2022::{
+    extension::StateWithExtensions, instruction as token_ix,
+    state::{Account as TokenAccount, Mint},
+};
 
 /// Default sane pool parameters used by most tests. Override per-test by
 /// calling `init_pool_with_params`.
@@ -300,6 +303,128 @@ impl TestEnv {
         self.send(&[ix], &[]).await.unwrap();
     }
 
+    // ---- Liquidity ----
+
+    pub fn ix_add_liquidity(
+        &self,
+        user: &Pubkey,
+        user_a_ata: &Pubkey,
+        user_b_ata: &Pubkey,
+        user_lp_ata: &Pubkey,
+        amount_a_max: u64,
+        amount_b_max: u64,
+        min_lp_out: u64,
+    ) -> Instruction {
+        let pool = self.pool_pda().0;
+        let vault_a = self.vault_a_pda().0;
+        let vault_b = self.vault_b_pda().0;
+        let lp_mint = self.lp_mint_pda().0;
+        let data = LiquidityInstruction::AddLiquidity {
+            amount_a_max,
+            amount_b_max,
+            min_lp_out,
+        };
+        Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(pool, false),
+                AccountMeta::new(vault_a, false),
+                AccountMeta::new(vault_b, false),
+                AccountMeta::new(lp_mint, false),
+                AccountMeta::new(*user_a_ata, false),
+                AccountMeta::new(*user_b_ata, false),
+                AccountMeta::new(*user_lp_ata, false),
+                AccountMeta::new_readonly(*user, true),
+                AccountMeta::new_readonly(self.mint_a.pubkey(), false),
+                AccountMeta::new_readonly(self.mint_b.pubkey(), false),
+                AccountMeta::new_readonly(self.token_program, false),
+            ],
+            data: borsh::to_vec(&data).unwrap(),
+        }
+    }
+
+    pub fn ix_remove_liquidity(
+        &self,
+        user: &Pubkey,
+        user_a_ata: &Pubkey,
+        user_b_ata: &Pubkey,
+        user_lp_ata: &Pubkey,
+        lp_amount: u64,
+        min_a_out: u64,
+        min_b_out: u64,
+    ) -> Instruction {
+        let pool = self.pool_pda().0;
+        let vault_a = self.vault_a_pda().0;
+        let vault_b = self.vault_b_pda().0;
+        let lp_mint = self.lp_mint_pda().0;
+        let data = LiquidityInstruction::RemoveLiquidity {
+            lp_amount,
+            min_a_out,
+            min_b_out,
+        };
+        Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(pool, false),
+                AccountMeta::new(vault_a, false),
+                AccountMeta::new(vault_b, false),
+                AccountMeta::new(lp_mint, false),
+                AccountMeta::new(*user_a_ata, false),
+                AccountMeta::new(*user_b_ata, false),
+                AccountMeta::new(*user_lp_ata, false),
+                AccountMeta::new_readonly(*user, true),
+                AccountMeta::new_readonly(self.mint_a.pubkey(), false),
+                AccountMeta::new_readonly(self.mint_b.pubkey(), false),
+                AccountMeta::new_readonly(self.token_program, false),
+            ],
+            data: borsh::to_vec(&data).unwrap(),
+        }
+    }
+
+    /// One-stop helper: create a user funded with some lamports and tokens
+    /// of both mints, plus an LP ATA. Returns `(user, ata_a, ata_b, ata_lp)`.
+    pub async fn setup_user(
+        &mut self,
+        sol_lamports: u64,
+        token_a: u64,
+        token_b: u64,
+    ) -> (Keypair, Pubkey, Pubkey, Pubkey) {
+        let user = self.create_funded_user(sol_lamports).await;
+        let ata_a = self
+            .fund_token(&user.pubkey(), &self.mint_a.pubkey(), token_a)
+            .await;
+        let ata_b = self
+            .fund_token(&user.pubkey(), &self.mint_b.pubkey(), token_b)
+            .await;
+        let ata_lp = self.create_ata(&user.pubkey(), &self.lp_mint_pda().0).await;
+        (user, ata_a, ata_b, ata_lp)
+    }
+
+    /// `setup_user` + `initialize_pool_default`, then make one initial
+    /// LP deposit. The depositor (returned) seeds the pool with
+    /// `(amount_a, amount_b)`.
+    pub async fn setup_pool_with_liquidity(
+        &mut self,
+        amount_a: u64,
+        amount_b: u64,
+    ) -> (Keypair, Pubkey, Pubkey, Pubkey) {
+        self.initialize_pool_default().await;
+        // First-deposit minimum is 1e6 per side; tests should pass amounts above.
+        let (user, ata_a, ata_b, ata_lp) =
+            self.setup_user(10_000_000_000, amount_a * 2, amount_b * 2).await;
+        let ix = self.ix_add_liquidity(
+            &user.pubkey(),
+            &ata_a,
+            &ata_b,
+            &ata_lp,
+            amount_a,
+            amount_b,
+            1,
+        );
+        self.send_with_new_blockhash(&[ix], &[&user]).await.unwrap();
+        (user, ata_a, ata_b, ata_lp)
+    }
+
     // ---- State readers ----
 
     pub async fn pool_state(&mut self) -> Pool {
@@ -328,8 +453,9 @@ impl TestEnv {
             .await
             .unwrap()
             .expect("token account not found");
-        spl_token_2022::state::Account::unpack(&acc.data)
+        StateWithExtensions::<TokenAccount>::unpack(&acc.data)
             .unwrap()
+            .base
             .amount
     }
 
@@ -340,7 +466,10 @@ impl TestEnv {
             .await
             .unwrap()
             .expect("mint not found");
-        Mint::unpack(&acc.data).unwrap().supply
+        StateWithExtensions::<Mint>::unpack(&acc.data)
+            .unwrap()
+            .base
+            .supply
     }
 }
 
